@@ -37,8 +37,20 @@ class TextAssemblerTests(unittest.TestCase):
         assembler = TextAssembler()
         assembler.feed("工作区里有一张失败现场。这是旧描述。")
         delta = assembler.feed("应改 StreamDownKit，不是 PopAgent。")
-        self.assertEqual(delta, "应改 StreamDownKit，不是 PopAgent。")
+        # SSE cannot rewind; keep the latest snapshot without re-streaming it.
+        self.assertEqual(delta, "")
         self.assertEqual(assembler.text, "应改 StreamDownKit，不是 PopAgent。")
+
+    def test_resent_opening_only_emits_suffix(self) -> None:
+        assembler = TextAssembler()
+        opening = (
+            "当前会话没有绑定 TutuStudio Task，本轮不会记到 Work。"
+            "我先在网关和各 provider 路径里查有没有 mid-request 注入（steer）的接口或转发。"
+        )
+        self.assertEqual(assembler.feed(opening), opening)
+        self.assertEqual(assembler.feed(opening), "")
+        self.assertEqual(assembler.feed(opening + "\n再看重复回复"), "\n再看重复回复")
+        self.assertEqual(assembler.text, opening + "\n再看重复回复")
 
     def test_incremental_token_still_appends(self) -> None:
         assembler = TextAssembler()
@@ -70,6 +82,30 @@ class ProviderReasoningSplitTests(unittest.TestCase):
         self.assertEqual(answer.reasoning, "")
         self.assertEqual(content.text, "应改 StreamDownKit")
         self.assertEqual(reasoning.text, "先读图再回答")
+
+    def test_cursor_assistant_snapshot_resent_is_not_duplicated(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        opening = "当前会话没有绑定 TutuStudio Task，本轮不会记到 Work。我先查 steer。"
+        first = extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": opening}]},
+            },
+            content,
+            reasoning,
+        )
+        second = extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": opening}]},
+            },
+            content,
+            reasoning,
+        )
+        self.assertEqual(first.content, opening)
+        self.assertEqual(second.content, "")
+        self.assertEqual(content.text, opening)
 
     def test_assistant_thinking_blocks_are_split(self) -> None:
         text, thinking = extract_parts_from_content(

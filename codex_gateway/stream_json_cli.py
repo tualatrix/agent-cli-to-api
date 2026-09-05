@@ -44,6 +44,8 @@ class TextAssembler:
                 delta = incoming[len(self.text) :]
                 self.text = incoming
                 return delta
+            if self.text.startswith(incoming):
+                return ""
             self.text += incoming
             return incoming
         if incoming.startswith(self.text):
@@ -57,18 +59,28 @@ class TextAssembler:
             prefix, _, suffix = incoming.partition(self.text)
             self.text = incoming
             return f"{prefix}{suffix}"
-        # Distinct full snapshot (not a token delta). Replace instead of concatenating
-        # so the same paragraph is not appended twice.
+        common = _common_prefix_len(self.text, incoming)
+        # Later assistant/thinking events often resend a near-complete snapshot.
+        # SSE clients cannot rewind, so only emit the unseen suffix. A full
+        # replacement with no shared prefix is stored but not re-streamed.
         looks_like_snapshot = (
             "\n" in incoming
             or incoming.endswith(("。", "！", "？", ".", "!", "?", "\n"))
             or len(incoming) > 80
         )
-        if self.text and looks_like_snapshot:
+        if self.text and (looks_like_snapshot or common >= min(len(self.text), 16)):
             self.text = incoming
-            return incoming
+            return incoming[common:] if common else ""
         self.text += incoming
         return incoming
+
+
+def _common_prefix_len(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
 
 
 async def iter_stream_json_events(
@@ -227,9 +239,14 @@ def extract_cursor_agent_parts(
     if not isinstance(message, dict):
         return StreamDelta()
     text, reasoning = extract_parts_from_content(message.get("content"))
+    incremental = evt.get("subtype") == "delta"
     return StreamDelta(
-        content=content_assembler.feed(text),
-        reasoning=(reasoning_assembler.feed(reasoning) if reasoning_assembler is not None else reasoning),
+        content=content_assembler.feed(text, incremental=incremental),
+        reasoning=(
+            reasoning_assembler.feed(reasoning, incremental=incremental)
+            if reasoning_assembler is not None
+            else reasoning
+        ),
     )
 
 
