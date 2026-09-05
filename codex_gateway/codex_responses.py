@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .openai_compat import ChatCompletionRequest, ChatMessage
+from .openai_compat import ChatCompletionRequest, ChatMessage, _image_url_from_part
 
 _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 _OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -537,13 +537,8 @@ def convert_chat_completions_to_codex_responses(
                         "text": part["text"],
                     }
                 )
-            if ptype in {"image_url", "input_image"} and role == "user":
-                image = part.get("image_url")
-                url = None
-                if isinstance(image, dict) and isinstance(image.get("url"), str):
-                    url = image["url"]
-                elif isinstance(image, str):
-                    url = image
+            if ptype in {"image_url", "input_image", "image"} and role == "user":
+                url = _image_url_from_part(part)
                 if isinstance(url, str) and url:
                     msg["content"].append({"type": "input_image", "image_url": url})
             if ptype in {"file", "input_file"} and role == "user":
@@ -690,6 +685,7 @@ async def collect_codex_responses_text_and_usage(
     events: AsyncIterator[dict[str, Any]],
 ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None, list[dict[str, Any]]]:
     chunks: list[str] = []
+    reasoning_chunks: list[str] = []
     usage: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] | None = None
     images: list[dict[str, Any]] = []
@@ -708,6 +704,19 @@ async def collect_codex_responses_text_and_usage(
         # Some very short responses can arrive only as a final "done" event.
         if t == "response.output_text.done" and not chunks and isinstance(evt.get("text"), str):
             chunks.append(evt["text"])
+        if t in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning.delta",
+            "response.reasoning_text.delta",
+        } and isinstance(evt.get("delta"), str):
+            reasoning_chunks.append(evt["delta"])
+        if t in {"response.reasoning_summary_text.done", "response.reasoning.done"} and not reasoning_chunks:
+            if isinstance(evt.get("text"), str):
+                reasoning_chunks.append(evt["text"])
+        if t == "response.reasoning_summary_part.added":
+            part = evt.get("part") or {}
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]:
+                reasoning_chunks.append(part["text"])
         if t == "response.output_item.done":
             item = evt.get("item")
             if isinstance(item, dict) and item.get("type") == "image_generation_call":
@@ -747,7 +756,7 @@ async def collect_codex_responses_text_and_usage(
     if incomplete_message and not chunks and not images and not tool_calls:
         raise RuntimeError(incomplete_message)
 
-    return "".join(chunks), usage, tool_calls, images
+    return "".join(chunks), usage, tool_calls, images, "".join(reasoning_chunks)
 
 
 async def collect_codex_responses_native_response(

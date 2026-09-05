@@ -91,12 +91,13 @@ class SearchTests(unittest.TestCase):
             ]:
                 yield evt
 
-        text, usage, tool_calls, images = asyncio.run(collect_codex_responses_text_and_usage(events()))
+        text, usage, tool_calls, images, reasoning = asyncio.run(collect_codex_responses_text_and_usage(events()))
 
         self.assertEqual(text, "")
         self.assertIsNone(usage)
         self.assertIsNone(tool_calls)
         self.assertEqual(images[0]["b64_json"], "abc123")
+        self.assertEqual(reasoning, "")
 
     def test_codex_text_collector_raises_on_incomplete_stream_without_result(self) -> None:
         async def events():

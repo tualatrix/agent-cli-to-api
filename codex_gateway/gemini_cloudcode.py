@@ -15,7 +15,7 @@ from typing import Any
 
 from .config import settings
 from .http_client import get_async_client, request_json_with_retries
-from .openai_compat import ChatCompletionRequest, ChatMessage, RequestInputError, normalize_message_content
+from .openai_compat import ChatCompletionRequest, ChatMessage, RequestInputError, _image_url_from_part, normalize_message_content
 
 
 @dataclass(frozen=True)
@@ -612,7 +612,7 @@ def _messages_to_cloudcode_payload(
         payload["request"].setdefault("generationConfig", {})
         payload["request"]["generationConfig"]["thinkingConfig"] = {
             "thinkingBudget": budget,
-            "includeThoughts": False,
+            "includeThoughts": True,
         }
 
     tool_call_name_map: dict[str, str] = {}
@@ -650,13 +650,8 @@ def _messages_to_cloudcode_payload(
             if ptype == "text" and isinstance(part.get("text"), str):
                 node["parts"].append({"text": part["text"]})
                 continue
-            if ptype in {"image_url", "input_image"}:
-                image = part.get("image_url")
-                url = None
-                if isinstance(image, dict) and isinstance(image.get("url"), str):
-                    url = image["url"]
-                elif isinstance(image, str):
-                    url = image
+            if ptype in {"image_url", "input_image", "image"}:
+                url = _image_url_from_part(part)
                 if not isinstance(url, str) or not url.strip():
                     continue
                 data, mime = _decode_data_url(url)
@@ -710,24 +705,33 @@ def _messages_to_cloudcode_payload(
 
 
 def _extract_text_from_cloudcode_response(obj: dict[str, Any]) -> str:
+    return _extract_parts_from_cloudcode_response(obj)[0]
+
+
+def _extract_parts_from_cloudcode_response(obj: dict[str, Any]) -> tuple[str, str]:
     # Cloud Code Assist wraps the Gemini response under a top-level `response` field.
     if isinstance(obj.get("response"), dict):
         obj = obj["response"]  # type: ignore[assignment]
     # Official Gemini format: candidates[0].content.parts[].text
     candidates = obj.get("candidates")
     if not isinstance(candidates, list) or not candidates:
-        return ""
+        return "", ""
     content = (candidates[0] or {}).get("content")
     if not isinstance(content, dict):
-        return ""
+        return "", ""
     parts = content.get("parts")
     if not isinstance(parts, list):
-        return ""
-    out: list[str] = []
+        return "", ""
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     for p in parts:
-        if isinstance(p, dict) and isinstance(p.get("text"), str):
-            out.append(p["text"])
-    return "".join(out)
+        if not isinstance(p, dict) or not isinstance(p.get("text"), str):
+            continue
+        if p.get("thought") is True:
+            reasoning_parts.append(p["text"])
+        else:
+            text_parts.append(p["text"])
+    return "".join(text_parts), "".join(reasoning_parts)
 
 
 def _extract_usage_from_cloudcode_response(obj: dict[str, Any]) -> dict[str, int] | None:
@@ -767,7 +771,7 @@ async def generate_cloudcode(
     model_name: str,
     reasoning_effort: str,
     timeout_seconds: int,
-) -> tuple[str, dict[str, int] | None]:
+) -> tuple[str, dict[str, int] | None, str]:
     access = await get_gemini_access_token(timeout_seconds=min(timeout_seconds, 30))
     project_id = await resolve_gemini_project_id(access_token=access, timeout_seconds=min(timeout_seconds, 30))
     payload = _messages_to_cloudcode_payload(
@@ -795,7 +799,8 @@ async def generate_cloudcode(
     obj = resp.json()
     if not isinstance(obj, dict):
         return "", None
-    return _extract_text_from_cloudcode_response(obj), _extract_usage_from_cloudcode_response(obj)
+    text, reasoning = _extract_parts_from_cloudcode_response(obj)
+    return text, _extract_usage_from_cloudcode_response(obj), reasoning
 
 
 async def iter_cloudcode_stream_events(
@@ -854,7 +859,12 @@ async def iter_cloudcode_stream_events(
                 continue
             if not isinstance(obj, dict):
                 continue
-            text = _extract_text_from_cloudcode_response(obj)
+            text, reasoning = _extract_parts_from_cloudcode_response(obj)
+            if reasoning:
+                evt = {"type": "thinking", "subtype": "delta", "text": reasoning}
+                if event_callback:
+                    event_callback(evt)
+                yield evt
             if text:
                 evt = {"type": "message", "role": "assistant", "content": text}
                 if event_callback:

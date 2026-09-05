@@ -14,7 +14,13 @@ import httpx
 
 from .config import settings
 from .http_client import get_async_client, request_json_with_retries
-from .openai_compat import ChatCompletionRequest, ChatMessage, RequestInputError, normalize_message_content
+from .openai_compat import (
+    ChatCompletionRequest,
+    ChatMessage,
+    RequestInputError,
+    _image_url_from_part,
+    normalize_message_content,
+)
 
 _ANTHROPIC_VERSION = "2023-06-01"
 _DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -294,13 +300,9 @@ def _content_to_anthropic_blocks(content: object) -> list[dict[str, Any]]:
             text = item.get("text")
             if isinstance(text, str) and text.strip():
                 blocks.append({"type": "text", "text": text})
-        elif t == "image_url":
-            image_url = item.get("image_url")
-            if isinstance(image_url, dict):
-                url = image_url.get("url")
-            else:
-                url = None
-            if not isinstance(url, str):
+        elif t in {"image_url", "input_image", "image"}:
+            url = _image_url_from_part(item)
+            if not isinstance(url, str) or not url:
                 continue
             parsed = _parse_data_url(url)
             if not parsed:
@@ -489,18 +491,30 @@ def _apply_openai_tools(payload: dict[str, Any], req: ChatCompletionRequest) -> 
 
 
 def _extract_text_from_anthropic_response(data: Any) -> str:
+    return _extract_parts_from_anthropic_response(data)[0]
+
+
+def _extract_parts_from_anthropic_response(data: Any) -> tuple[str, str]:
     if not isinstance(data, dict):
-        return ""
+        return "", ""
     content = data.get("content")
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                t = item.get("text")
-                if isinstance(t, str):
-                    parts.append(t)
-        return "".join(parts)
-    return ""
+    if not isinstance(content, list):
+        return "", ""
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "text":
+            t = item.get("text")
+            if isinstance(t, str):
+                text_parts.append(t)
+        elif item_type in {"thinking", "redacted_thinking"}:
+            t = item.get("thinking") or item.get("text")
+            if isinstance(t, str) and t:
+                reasoning_parts.append(t)
+    return "".join(text_parts), "".join(reasoning_parts)
 
 
 def _extract_usage_from_anthropic_response(data: Any) -> dict[str, int] | None:
@@ -543,7 +557,7 @@ async def generate_oauth(
     *,
     req: ChatCompletionRequest,
     model_name: str,
-) -> tuple[str, dict[str, int] | None]:
+) -> tuple[str, dict[str, int] | None, str]:
     t0 = time.time()
     
     # Try CLI config first, then OAuth creds
@@ -616,7 +630,8 @@ async def generate_oauth(
         resp.status_code, api_latency_ms,
     )
 
-    return _extract_text_from_anthropic_response(data), _extract_usage_from_anthropic_response(data)
+    text, reasoning = _extract_parts_from_anthropic_response(data)
+    return text, _extract_usage_from_anthropic_response(data), reasoning
 
 
 async def _iter_sse_events(resp: httpx.Response) -> AsyncIterator[tuple[str | None, str]]:
@@ -644,25 +659,38 @@ async def _iter_sse_events(resp: httpx.Response) -> AsyncIterator[tuple[str | No
 
 
 def _extract_delta_text(obj: Any) -> str:
+    return _extract_stream_parts(obj, None)[0]
+
+
+def _extract_stream_parts(obj: Any, current_block: str | None) -> tuple[str, str]:
     if not isinstance(obj, dict):
-        return ""
+        return "", ""
     delta = obj.get("delta")
     if isinstance(delta, dict):
-        t = delta.get("text")
-        if isinstance(t, str) and t:
-            return t
-    t2 = obj.get("text")
-    if isinstance(t2, str) and t2:
-        return t2
+        delta_type = str(delta.get("type") or "")
+        thinking = delta.get("thinking")
+        text = delta.get("text")
+        if delta_type in {"thinking_delta", "thinking"} or current_block in {"thinking", "redacted_thinking"}:
+            if isinstance(thinking, str) and thinking:
+                return "", thinking
+            if isinstance(text, str) and text and delta_type != "text_delta":
+                return "", text
+        if isinstance(text, str) and text:
+            return text, ""
     content_block = obj.get("content_block")
     if isinstance(content_block, dict):
-        t3 = content_block.get("text")
-        if isinstance(t3, str) and t3:
-            return t3
+        block_type = str(content_block.get("type") or "")
+        if block_type in {"thinking", "redacted_thinking"}:
+            thinking = content_block.get("thinking") or content_block.get("text")
+            if isinstance(thinking, str) and thinking:
+                return "", thinking
+        text = content_block.get("text")
+        if isinstance(text, str) and text:
+            return text, ""
     message = obj.get("message")
     if isinstance(message, dict):
-        return _extract_text_from_anthropic_response(message)
-    return ""
+        return _extract_parts_from_anthropic_response(message)
+    return "", ""
 
 
 def _extract_stream_usage(obj: Any) -> dict[str, int] | None:
@@ -813,6 +841,7 @@ async def iter_oauth_stream_events(
     url = f"{base_url.rstrip('/')}/v1/messages"
 
     usage: dict[str, int] | None = None
+    current_block: str | None = None
     client = await get_async_client("claude-stream")
     async with client.stream("POST", url, json=payload, headers=headers, timeout=settings.timeout_seconds) as resp:
         try:
@@ -827,12 +856,39 @@ async def iter_oauth_stream_events(
                     obj = json.loads(data)
                 except Exception:
                     continue
-                delta = _extract_delta_text(obj)
-                if delta:
-                    yield {
-                        "type": "assistant",
-                        "message": {"role": "assistant", "content": [{"type": "text", "text": delta}]},
-                    }
+                event_type = obj.get("type")
+                if event_type == "content_block_start":
+                    block = obj.get("content_block") if isinstance(obj.get("content_block"), dict) else {}
+                    current_block = str(block.get("type") or "") or None
+                    thinking = block.get("thinking") if isinstance(block.get("thinking"), str) else ""
+                    text = block.get("text") if isinstance(block.get("text"), str) else ""
+                    if current_block in {"thinking", "redacted_thinking"} and thinking:
+                        yield {"type": "thinking", "subtype": "delta", "text": thinking}
+                    elif current_block == "text" and text:
+                        yield {
+                            "type": "assistant",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                        }
+                elif event_type == "content_block_delta":
+                    content, reasoning = _extract_stream_parts(obj, current_block)
+                    if reasoning:
+                        yield {"type": "thinking", "subtype": "delta", "text": reasoning}
+                    if content:
+                        yield {
+                            "type": "assistant",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": content}]},
+                        }
+                elif event_type == "content_block_stop":
+                    current_block = None
+                else:
+                    content, reasoning = _extract_stream_parts(obj, current_block)
+                    if reasoning:
+                        yield {"type": "thinking", "subtype": "delta", "text": reasoning}
+                    if content:
+                        yield {
+                            "type": "assistant",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": content}]},
+                        }
                 maybe_usage = _extract_stream_usage(obj)
                 if maybe_usage:
                     usage = maybe_usage

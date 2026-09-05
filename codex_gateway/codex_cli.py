@@ -32,6 +32,7 @@ class CodexResult:
     text: str
     usage: dict[str, int] | None
     raw_events: list[dict] | None = None
+    reasoning: str = ""
 
 
 def _build_env(codex_cli_home: str | None) -> dict[str, str]:
@@ -358,6 +359,7 @@ async def collect_codex_text_and_usage_from_events(
     events: AsyncIterator[dict],
 ) -> CodexResult:
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     usage: dict[str, int] | None = None
 
     async for evt in events:
@@ -365,6 +367,8 @@ async def collect_codex_text_and_usage_from_events(
             item = evt.get("item") or {}
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 text_parts.append(item["text"])
+            if item.get("type") == "reasoning" and isinstance(item.get("text"), str):
+                reasoning_parts.append(item["text"])
         if evt.get("type") == "turn.completed":
             raw_usage = evt.get("usage") or {}
             if isinstance(raw_usage, dict):
@@ -377,4 +381,8 @@ async def collect_codex_text_and_usage_from_events(
                     "total_tokens": in_tokens + out_tokens,
                 }
 
-    return CodexResult(text="".join(text_parts).strip(), usage=usage)
+    return CodexResult(
+        text="".join(text_parts).strip(),
+        usage=usage,
+        reasoning="".join(reasoning_parts).strip(),
+    )

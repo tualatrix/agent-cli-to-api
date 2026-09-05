@@ -293,6 +293,49 @@ def messages_to_prompt(messages: list[ChatMessage]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _image_url_from_part(part: dict[str, Any]) -> str | None:
+    part_type = part.get("type")
+    if part_type not in {"image_url", "input_image", "image"}:
+        return None
+
+    image = part.get("image_url")
+    if isinstance(image, dict):
+        url = image.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+    elif isinstance(image, str) and image.strip():
+        return image.strip()
+
+    url = part.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+
+    source = part.get("source")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        media_type = source.get("media_type") or source.get("mediaType") or "image/png"
+        data = source.get("data")
+        if isinstance(media_type, str) and isinstance(data, str) and data.strip():
+            return f"data:{media_type};base64,{''.join(data.split())}"
+
+    # PopAgent / ad-hoc: {type: "image", mimeType, data}
+    data = part.get("data")
+    if isinstance(data, str) and data.strip():
+        media_type = (
+            part.get("mimeType")
+            or part.get("mime_type")
+            or part.get("mediaType")
+            or part.get("media_type")
+            or "image/png"
+        )
+        if not isinstance(media_type, str) or not media_type.strip():
+            media_type = "image/png"
+        raw = "".join(data.split())
+        if raw.startswith("data:"):
+            return raw
+        return f"data:{media_type.strip()};base64,{raw}"
+    return None
+
+
 def extract_image_urls_from_content(content: Any) -> list[str]:
     urls: list[str] = []
     if content is None:
@@ -300,15 +343,9 @@ def extract_image_urls_from_content(content: Any) -> list[str]:
 
     # Accept single-part formats in addition to the OpenAI list-of-parts format.
     if isinstance(content, dict):
-        part_type = content.get("type")
-        if part_type in {"image_url", "input_image"}:
-            image = content.get("image_url")
-            if isinstance(image, dict):
-                url = image.get("url")
-                if isinstance(url, str) and url:
-                    urls.append(url)
-            elif isinstance(image, str) and image:
-                urls.append(image)
+        url = _image_url_from_part(content)
+        if url:
+            urls.append(url)
         return urls
 
     if not isinstance(content, list):
@@ -317,16 +354,9 @@ def extract_image_urls_from_content(content: Any) -> list[str]:
     for part in content:
         if not isinstance(part, dict):
             continue
-        part_type = part.get("type")
-        if part_type not in {"image_url", "input_image"}:
-            continue
-        image = part.get("image_url")
-        if isinstance(image, dict):
-            url = image.get("url")
-            if isinstance(url, str) and url:
-                urls.append(url)
-        elif isinstance(image, str) and image:
-            urls.append(image)
+        url = _image_url_from_part(part)
+        if url:
+            urls.append(url)
 
     return urls
 
@@ -336,6 +366,71 @@ def extract_image_urls(messages: list[ChatMessage]) -> list[str]:
     for message in messages:
         urls.extend(extract_image_urls_from_content(message.content))
     return urls
+
+
+def _strip_image_parts(content: Any) -> Any:
+    if isinstance(content, dict):
+        return "" if _image_url_from_part(content) else content
+    if not isinstance(content, list):
+        return content
+    kept: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if _image_url_from_part(part):
+            continue
+        kept.append(part)
+    return kept
+
+
+def latest_user_message_has_images(messages: list[ChatMessage]) -> bool:
+    """True only when the newest user message itself contains an image part."""
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        return bool(extract_image_urls_from_content(message.content))
+    return False
+
+
+def drop_stale_history_images(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Keep images only on the latest user turn that actually attached some.
+
+    Chat clients resend the full history. Older screenshots/photos would otherwise
+    be forwarded again and the model often describes the previous picture.
+    Text-only follow-ups keep that last image for vision backends (e.g. "what
+    color is it?") but must not be treated as a newly attached file this turn.
+    """
+    latest_user_with_images: int | None = None
+    for idx, message in enumerate(messages):
+        if message.role == "user" and extract_image_urls_from_content(message.content):
+            latest_user_with_images = idx
+    if latest_user_with_images is None:
+        return messages
+
+    updated: list[ChatMessage] = []
+    for idx, message in enumerate(messages):
+        if idx == latest_user_with_images or not extract_image_urls_from_content(message.content):
+            updated.append(message)
+            continue
+        updated.append(message.model_copy(update={"content": _strip_image_parts(message.content)}))
+    return updated
+
+
+def prompt_with_attached_image_files(prompt: str, image_files: list[str]) -> str:
+    """Tell a text-only CLI agent which files to read for this turn's images."""
+    paths = [path for path in image_files if (path or "").strip()]
+    if not paths:
+        return prompt
+    lines = [
+        "The user attached image file(s) for this turn.",
+        "Read these exact files with your file/image tools and describe them.",
+        "Do not search the workspace for older screenshots; previous images are not part of this turn.",
+        "",
+    ]
+    lines.extend(f"- {path}" for path in paths)
+    note = "\n".join(lines)
+    body = (prompt or "").rstrip()
+    return f"{body}\n\n{note}" if body else note
 
 
 def extract_file_inputs_from_content(content: Any) -> list[dict[str, Any]]:

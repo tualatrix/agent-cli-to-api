@@ -61,18 +61,23 @@ from .openai_compat import (
     ErrorResponse,
     ResponsesRequest,
     compat_chat_request_to_chat_request,
+    drop_stale_history_images,
     extract_file_inputs,
     extract_image_urls,
+    latest_user_message_has_images,
     messages_to_prompt,
     normalize_message_content,
+    prompt_with_attached_image_files,
     RequestInputError,
     responses_request_to_chat_request,
 )
 from .stream_json_cli import (
     TextAssembler,
-    extract_claude_delta,
-    extract_cursor_agent_delta,
-    extract_gemini_delta,
+    extract_claude_parts,
+    extract_codex_cli_parts,
+    extract_codex_responses_parts,
+    extract_cursor_agent_parts,
+    extract_gemini_parts,
     extract_usage_from_claude_result,
     extract_usage_from_gemini_result,
     iter_stream_json_events,
@@ -697,6 +702,13 @@ def _response_json_or_text(resp) -> tuple[dict[str, Any] | list[Any] | None, str
         return None, resp.text
     except Exception:
         return None, ""
+
+
+def _assistant_message_body(content: str, reasoning: str = "") -> dict:
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return message
 
 
 def _chat_completion_to_responses(chat: dict) -> dict:
@@ -1525,13 +1537,22 @@ def _materialize_request_images(
                 status_code=413,
                 detail=f"Image too large ({len(data)} bytes > {settings.max_image_bytes})",
             )
-        filename = f"{resp_id}-{idx}.{ext}"
+        filename = f"user-image-{idx}.{ext}"
         path = os.path.join(tmpdir.name, filename)
         with open(path, "wb") as f:
             f.write(data)
         paths.append(path)
 
     return tmpdir, paths
+
+
+def _cursor_agent_image_args(image_files: list[str]) -> list[str]:
+    if not image_files:
+        return []
+    extra_root = os.path.dirname(image_files[0])
+    if not extra_root:
+        return []
+    return ["--add-dir", extra_root]
 
 
 @app.on_event("startup")
@@ -1812,6 +1833,7 @@ async def responses(
     global _active_requests
     _check_auth(authorization)
     chat_req = responses_request_to_chat_request(req)
+    chat_req = chat_req.model_copy(update={"messages": drop_stale_history_images(chat_req.messages)})
     if not chat_req.messages:
         return _openai_error("Missing input for responses request", status_code=422)
     if chat_req.stream:
@@ -2058,6 +2080,7 @@ async def chat_completions(
         req = compat_chat_request_to_chat_request(req)
     except ValueError as e:
         return _openai_error(str(e), status_code=422)
+    req = req.model_copy(update={"messages": drop_stale_history_images(req.messages)})
 
     log_mode = settings.effective_log_mode()
 
@@ -2226,35 +2249,48 @@ async def chat_completions(
 
         tmpdir: tempfile.TemporaryDirectory | None = None
         image_files: list[str] = []
-        if provider == "codex":
-            if use_codex_backend:
-                # No temp files needed; Codex backend accepts data: URLs directly.
-                if (log_mode == "full" and image_urls) or (settings.log_events and image_urls):
-                    for idx, url in enumerate(image_urls[-max(settings.max_image_count, 0) :]):
-                        try:
-                            data, ext = _decode_data_url(url)
-                            size = len(data)
-                        except Exception:
-                            ext, size = "bin", -1
-                        logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
-                    logger.info("[%s] decoded_images=%d", resp_id, len(image_urls))
-            else:
-                try:
-                    tmpdir, image_files = _materialize_request_images(req, resp_id=resp_id)
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    return _openai_error(f"Failed to decode image input: {e}", status_code=400)
+        # Cursor has no native vision: only materialize + prompt when THIS user
+        # turn attached an image. Replaying the last screenshot on later text
+        # ("start fixing", "review") makes the agent keep saying "open the image".
+        latest_turn_has_images = latest_user_message_has_images(req.messages)
+        needs_image_files = bool(
+            image_urls
+            and (
+                (provider == "codex" and not use_codex_backend)
+                or (provider == "cursor-agent" and latest_turn_has_images)
+            )
+        )
+        if needs_image_files:
+            try:
+                tmpdir, image_files = _materialize_request_images(req, resp_id=resp_id)
+            except HTTPException:
+                raise
+            except Exception as e:
+                return _openai_error(f"Failed to decode image input: {e}", status_code=400)
+            if provider == "cursor-agent" and image_files:
+                prompt = prompt_with_attached_image_files(prompt, image_files)
+                if len(prompt) > settings.max_prompt_chars:
+                    return _openai_error(f"Prompt too large ({len(prompt)} chars)", status_code=413)
 
-                if (log_mode == "full" and image_files) or (settings.log_events and image_files):
-                    for idx, path in enumerate(image_files):
-                        try:
-                            size = os.path.getsize(path)
-                        except OSError:
-                            size = -1
-                        ext = os.path.splitext(path)[1].lstrip(".") or "bin"
-                        logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
-                    logger.info("[%s] decoded_images=%d", resp_id, len(image_files))
+        if image_urls and ((log_mode == "full") or settings.log_events):
+            if image_files:
+                for idx, path in enumerate(image_files):
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        size = -1
+                    ext = os.path.splitext(path)[1].lstrip(".") or "bin"
+                    logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
+                logger.info("[%s] decoded_images=%d", resp_id, len(image_files))
+            elif provider == "codex" and use_codex_backend:
+                for idx, url in enumerate(image_urls[-max(settings.max_image_count, 0) :]):
+                    try:
+                        data, ext = _decode_data_url(url)
+                        size = len(data)
+                    except Exception:
+                        ext, size = "bin", -1
+                    logger.info("[%s] image[%d] ext=%s bytes=%d", resp_id, idx, ext, size)
+                logger.info("[%s] decoded_images=%d", resp_id, len(image_urls))
 
         def _capture_codex_headers(headers: dict[str, str]) -> None:
             if not headers:
@@ -2359,6 +2395,7 @@ async def chat_completions(
 
         if not req.stream:
             usage: dict[str, int] | None = None
+            reasoning = ""
             try:
                 async with sem:
                     if provider == "codex":
@@ -2401,7 +2438,7 @@ async def chat_completions(
                                     event_callback=_evt_log if settings.log_events else None,
                                     response_headers_cb=_capture_codex_headers,
                                 )
-                                text, usage, tool_calls, images = await collect_codex_responses_text_and_usage(events)
+                                text, usage, tool_calls, images, reasoning_text = await collect_codex_responses_text_and_usage(events)
                                 if images:
                                     md_parts = []
                                     for idx, img in enumerate(images):
@@ -2417,7 +2454,13 @@ async def chat_completions(
                                 return type(
                                     "BackendResult",
                                     (),
-                                    {"text": text, "usage": usage, "tool_calls": tool_calls, "images": images},
+                                    {
+                                        "text": text,
+                                        "usage": usage,
+                                        "tool_calls": tool_calls,
+                                        "images": images,
+                                        "reasoning": reasoning_text,
+                                    },
                                 )()
 
                             events = iter_codex_events(
@@ -2466,6 +2509,7 @@ async def chat_completions(
                         text = result.text
                         usage = result.usage
                         tool_calls = getattr(result, "tool_calls", None)
+                        reasoning = getattr(result, "reasoning", "") or ""
                     elif provider == "cursor-agent":
                         cursor_model = provider_model or settings.cursor_agent_model or "auto"
                         if settings.log_events:
@@ -2493,11 +2537,13 @@ async def chat_completions(
                             cmd.extend(["--model", cursor_model])
                         if settings.cursor_agent_stream_partial_output:
                             cmd.append("--stream-partial-output")
+                        cmd.extend(_cursor_agent_image_args(image_files))
                         cmd.append(prompt)
                         if settings.log_events:
                             logger.info("[%s] cursor-agent cmd=%s", resp_id, " ".join(cmd[:12] + (["..."] if len(cmd) > 12 else [])))
 
                         assembler = TextAssembler()
+                        reasoning_assembler = TextAssembler()
                         fallback_text: str | None = None
                         reported_model: str | None = None
                         async for evt in iter_stream_json_events(
@@ -2524,10 +2570,11 @@ async def chat_completions(
                                         evt.get("permissionMode"),
                                         evt.get("session_id"),
                                     )
-                            extract_cursor_agent_delta(evt, assembler)
+                            extract_cursor_agent_parts(evt, assembler, reasoning_assembler)
                             if evt.get("type") == "result" and isinstance(evt.get("result"), str):
                                 fallback_text = evt["result"]
                         text = assembler.text or (fallback_text or "")
+                        reasoning = reasoning_assembler.text
                     elif provider == "claude":
                         claude_model = provider_model or settings.claude_model or "sonnet"
                         if use_claude_oauth:
@@ -2546,7 +2593,7 @@ async def chat_completions(
                                 stream=req.stream,
                                 max_tokens=req.max_tokens,
                             )
-                            text, usage = await claude_oauth_generate(req=req2, model_name=claude_model)
+                            text, usage, reasoning = await claude_oauth_generate(req=req2, model_name=claude_model)
                         else:
                             cmd = [
                                 settings.claude_bin,
@@ -2565,6 +2612,7 @@ async def chat_completions(
                             cmd.append(prompt)
 
                             assembler = TextAssembler()
+                            reasoning_assembler = TextAssembler()
                             fallback_text = None
                             async for evt in iter_stream_json_events(
                                 cmd=cmd,
@@ -2574,13 +2622,14 @@ async def chat_completions(
                                 event_callback=_evt_log,
                                 stderr_callback=_stderr_log,
                             ):
-                                extract_claude_delta(evt, assembler)
+                                extract_claude_parts(evt, assembler, reasoning_assembler)
                                 maybe_usage = extract_usage_from_claude_result(evt)
                                 if maybe_usage:
                                     usage = maybe_usage
                                 if evt.get("type") == "result" and isinstance(evt.get("result"), str):
                                     fallback_text = evt["result"]
                             text = assembler.text or (fallback_text or "")
+                            reasoning = reasoning_assembler.text
                     elif provider == "gemini":
                         gemini_model = provider_model or settings.gemini_model or "gemini-3-flash-preview"
                         if use_gemini_cloudcode:
@@ -2594,7 +2643,7 @@ async def chat_completions(
                                 )
                             msgs = _maybe_inject_automation_guard_messages(req.messages)
                             req2 = ChatCompletionRequest(model=req.model, messages=msgs, stream=req.stream)
-                            text, usage = await gemini_cloudcode_generate(
+                            text, usage, reasoning = await gemini_cloudcode_generate(
                                 req2,
                                 model_name=gemini_model,
                                 reasoning_effort=reasoning_effort,
@@ -2607,6 +2656,7 @@ async def chat_completions(
                             cmd.append(prompt)
 
                             assembler = TextAssembler()
+                            reasoning_assembler = TextAssembler()
                             async for evt in iter_stream_json_events(
                                 cmd=cmd,
                                 env=None,
@@ -2615,11 +2665,12 @@ async def chat_completions(
                                 event_callback=_evt_log,
                                 stderr_callback=_stderr_log,
                             ):
-                                extract_gemini_delta(evt, assembler)
+                                extract_gemini_parts(evt, assembler, reasoning_assembler)
                                 maybe_usage = extract_usage_from_gemini_result(evt)
                                 if maybe_usage:
                                     usage = maybe_usage
                             text = assembler.text
+                            reasoning = reasoning_assembler.text
                     else:
                         raise RuntimeError(f"Unknown provider: {provider}")
             finally:
@@ -2627,6 +2678,7 @@ async def chat_completions(
                     tmpdir.cleanup()
 
             text = _maybe_strip_answer_tags(text).strip()
+            reasoning = _maybe_strip_answer_tags(reasoning).strip()
             duration_ms = int((time.time() - t0) * 1000)
             
             # Record stats and decrement active count
@@ -2656,7 +2708,7 @@ async def chat_completions(
                 usage_str = f" usage={usage}" if isinstance(usage, dict) else ""
                 logger.info("[%s] response status=200 duration_ms=%d chars=%d%s", resp_id, duration_ms, len(text), usage_str)
             finish_reason = "tool_calls" if tool_calls else "stop"
-            message: dict = {"role": "assistant", "content": text}
+            message: dict = _assistant_message_body(text, reasoning)
             if tool_calls:
                 message["tool_calls"] = tool_calls
 
@@ -2682,6 +2734,7 @@ async def chat_completions(
         async def sse_gen():
             global _active_requests
             assembled_text = ""
+            assembled_reasoning = ""
             stream_usage: dict[str, object] | None = None
             stream_tool_calls: list[dict[str, object]] | None = None
             try:
@@ -2803,6 +2856,7 @@ async def chat_completions(
                                 cmd.extend(["--model", cursor_model])
                             if settings.cursor_agent_stream_partial_output:
                                 cmd.append("--stream-partial-output")
+                            cmd.extend(_cursor_agent_image_args(image_files))
                             cmd.append(prompt)
                             if settings.log_events:
                                 logger.info("[%s] cursor-agent cmd=%s", resp_id, " ".join(cmd[:12] + (["..."] if len(cmd) > 12 else [])))
@@ -2895,6 +2949,7 @@ async def chat_completions(
 
                         queue: asyncio.Queue[dict | None] = asyncio.Queue()
                         assembler = TextAssembler()
+                        reasoning_assembler = TextAssembler()
                         sent_content = False
                         should_retry = False
 
@@ -2966,20 +3021,37 @@ async def chat_completions(
                                     break
 
                                 delta = ""
+                                reasoning_delta = ""
                                 if provider == "codex":
                                     if use_codex_backend:
-                                        if evt.get("type") == "response.output_text.delta" and isinstance(
-                                            evt.get("delta"), str
-                                        ):
-                                            delta = _maybe_strip_answer_tags(evt["delta"])
-                                        # Some short responses arrive only as a final "done" event.
-                                        if (
-                                            not delta
-                                            and not sent_content
+                                        parts = extract_codex_responses_parts(evt)
+                                        if evt.get("type") == "response.output_text.delta":
+                                            delta = _maybe_strip_answer_tags(parts.content)
+                                        elif (
+                                            not sent_content
                                             and evt.get("type") == "response.output_text.done"
-                                            and isinstance(evt.get("text"), str)
                                         ):
-                                            delta = _maybe_strip_answer_tags(evt["text"])
+                                            delta = _maybe_strip_answer_tags(parts.content)
+                                        if parts.reasoning and (
+                                            evt.get("type")
+                                            in {
+                                                "response.reasoning_summary_text.delta",
+                                                "response.reasoning.delta",
+                                                "response.reasoning_text.delta",
+                                                "response.reasoning_summary_part.added",
+                                            }
+                                            or (
+                                                not assembled_reasoning
+                                                and evt.get("type")
+                                                in {
+                                                    "response.reasoning_summary_text.done",
+                                                    "response.reasoning.done",
+                                                    "response.output_item.added",
+                                                    "response.output_item.done",
+                                                }
+                                            )
+                                        ):
+                                            reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
                                         if evt.get("type") == "response.completed":
                                             resp = evt.get("response") or {}
                                             u = resp.get("usage") if isinstance(resp, dict) else None
@@ -3003,10 +3075,9 @@ async def chat_completions(
                                                     stream_tool_calls = parsed_calls
                                             break
                                     else:
-                                        if evt.get("type") == "item.completed":
-                                            item = evt.get("item") or {}
-                                            if item.get("type") == "agent_message":
-                                                delta = _maybe_strip_answer_tags(str(item.get("text") or ""))
+                                        parts = extract_codex_cli_parts(evt, assembler, reasoning_assembler)
+                                        delta = _maybe_strip_answer_tags(parts.content)
+                                        reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
                                 elif provider == "cursor-agent":
                                     if (
                                         not cursor_init_logged
@@ -3025,11 +3096,40 @@ async def chat_completions(
                                                 evt.get("permissionMode"),
                                                 evt.get("session_id"),
                                             )
-                                    delta = _maybe_strip_answer_tags(extract_cursor_agent_delta(evt, assembler))
+                                    parts = extract_cursor_agent_parts(evt, assembler, reasoning_assembler)
+                                    delta = _maybe_strip_answer_tags(parts.content)
+                                    reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
                                 elif provider == "claude":
-                                    delta = _maybe_strip_answer_tags(extract_claude_delta(evt, assembler))
+                                    parts = extract_claude_parts(evt, assembler, reasoning_assembler)
+                                    delta = _maybe_strip_answer_tags(parts.content)
+                                    reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
                                 elif provider == "gemini":
-                                    delta = _maybe_strip_answer_tags(extract_gemini_delta(evt, assembler))
+                                    parts = extract_gemini_parts(evt, assembler, reasoning_assembler)
+                                    delta = _maybe_strip_answer_tags(parts.content)
+                                    reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
+
+                                if reasoning_delta:
+                                    assembled_reasoning += reasoning_delta
+                                    if settings.log_stream_deltas:
+                                        logger.info(
+                                            "[%s] stream reasoning: %s",
+                                            resp_id,
+                                            _inline_log_text(reasoning_delta),
+                                        )
+                                    chunk = {
+                                        "id": resp_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": requested_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {"reasoning_content": reasoning_delta},
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                                 if delta:
                                     sent_content = True

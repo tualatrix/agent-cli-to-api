@@ -306,6 +306,22 @@ def _openai_tool_calls_to_anthropic_blocks(tool_calls: Any) -> list[dict[str, An
     return blocks
 
 
+def _openai_reasoning_text(payload: dict[str, Any]) -> str:
+    for key in ("reasoning_content", "reasoning_text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    if isinstance(reasoning, dict):
+        for key in ("content", "text", "summary"):
+            value = reasoning.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
 def openai_chat_completion_to_anthropic_message(chat: dict[str, Any]) -> dict[str, Any]:
     choices = chat.get("choices") or []
     choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -317,6 +333,9 @@ def openai_chat_completion_to_anthropic_message(chat: dict[str, Any]) -> dict[st
         message = {}
 
     content_blocks: list[dict[str, Any]] = []
+    reasoning = _openai_reasoning_text(message)
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
     text = normalize_message_content(message.get("content"))
     if text:
         content_blocks.append({"type": "text", "text": text})
@@ -391,6 +410,7 @@ async def openai_stream_to_anthropic_events(
     model: str | None,
 ) -> AsyncIterator[str]:
     message_id = f"msg_{uuid.uuid4().hex}"
+    thinking_block_open = False
     text_block_open = False
     next_index = 0
     stop_reason = "end_turn"
@@ -431,8 +451,43 @@ async def openai_stream_to_anthropic_events(
         if not isinstance(delta, dict):
             delta = {}
 
+        reasoning = _openai_reasoning_text(delta)
+        if reasoning:
+            if text_block_open:
+                yield _anthropic_sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": next_index},
+                )
+                text_block_open = False
+                next_index += 1
+            if not thinking_block_open:
+                yield _anthropic_sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": next_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    },
+                )
+                thinking_block_open = True
+            yield _anthropic_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": next_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                },
+            )
+
         text = delta.get("content")
         if isinstance(text, str) and text:
+            if thinking_block_open:
+                yield _anthropic_sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": next_index},
+                )
+                thinking_block_open = False
+                next_index += 1
             if not text_block_open:
                 yield _anthropic_sse_event(
                     "content_block_start",
@@ -454,6 +509,13 @@ async def openai_stream_to_anthropic_events(
 
         tool_calls = delta.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
+            if thinking_block_open:
+                yield _anthropic_sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": next_index},
+                )
+                thinking_block_open = False
+                next_index += 1
             if text_block_open:
                 yield _anthropic_sse_event(
                     "content_block_stop",
@@ -482,6 +544,12 @@ async def openai_stream_to_anthropic_events(
         if isinstance(finish_reason, str) and finish_reason:
             stop_reason = _map_finish_reason_to_stop_reason(finish_reason) or stop_reason
 
+    if thinking_block_open:
+        yield _anthropic_sse_event(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": next_index},
+        )
+        next_index += 1
     if text_block_open:
         yield _anthropic_sse_event(
             "content_block_stop",

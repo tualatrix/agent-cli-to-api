@@ -15,6 +15,15 @@ class StreamJsonResult:
     usage: dict[str, int] | None
 
 
+@dataclass(frozen=True)
+class StreamDelta:
+    content: str = ""
+    reasoning: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.content or self.reasoning)
+
+
 class TextAssembler:
     """
     Some CLIs emit partial deltas and later emit a full final message.
@@ -24,17 +33,40 @@ class TextAssembler:
     def __init__(self) -> None:
         self.text = ""
 
-    def feed(self, incoming: str) -> str:
+    def feed(self, incoming: str, *, incremental: bool = False) -> str:
         incoming = incoming or ""
         if not incoming:
             return ""
         if incoming == self.text:
             return ""
+        if incremental:
+            if incoming.startswith(self.text):
+                delta = incoming[len(self.text) :]
+                self.text = incoming
+                return delta
+            self.text += incoming
+            return incoming
         if incoming.startswith(self.text):
             delta = incoming[len(self.text) :]
             self.text = incoming
             return delta
-        # Fallback: treat as delta chunk.
+        if self.text.startswith(incoming):
+            # Older / shorter snapshot of text we already assembled.
+            return ""
+        if self.text and self.text in incoming:
+            prefix, _, suffix = incoming.partition(self.text)
+            self.text = incoming
+            return f"{prefix}{suffix}"
+        # Distinct full snapshot (not a token delta). Replace instead of concatenating
+        # so the same paragraph is not appended twice.
+        looks_like_snapshot = (
+            "\n" in incoming
+            or incoming.endswith(("。", "！", "？", ".", "!", "?", "\n"))
+            or len(incoming) > 80
+        )
+        if self.text and looks_like_snapshot:
+            self.text = incoming
+            return incoming
         self.text += incoming
         return incoming
 
@@ -143,36 +175,175 @@ async def iter_stream_json_events(
 
 
 def extract_text_from_content(content: object) -> str:
-    return normalize_message_content(content)
+    return extract_parts_from_content(content)[0]
+
+
+def extract_parts_from_content(content: object) -> tuple[str, str]:
+    if content is None:
+        return "", ""
+    if isinstance(content, str):
+        return content, ""
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return normalize_message_content(content), ""
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "")
+        if part_type in {"thinking", "reasoning", "thought"}:
+            value = part.get("thinking") or part.get("reasoning") or part.get("text") or ""
+            if isinstance(value, str) and value:
+                reasoning_parts.append(value)
+            continue
+        if part_type == "text" and isinstance(part.get("text"), str):
+            text_parts.append(part["text"])
+    return "".join(text_parts), "".join(reasoning_parts)
 
 
 def extract_cursor_agent_delta(evt: dict, assembler: TextAssembler) -> str:
-    if evt.get("type") != "assistant":
-        return ""
+    return extract_cursor_agent_parts(evt, assembler).content
+
+
+def extract_cursor_agent_parts(
+    evt: dict,
+    content_assembler: TextAssembler,
+    reasoning_assembler: TextAssembler | None = None,
+) -> StreamDelta:
+    event_type = evt.get("type")
+    if event_type == "thinking":
+        if evt.get("subtype") == "completed":
+            return StreamDelta()
+        incoming = evt.get("text") if isinstance(evt.get("text"), str) else ""
+        if reasoning_assembler is not None:
+            incoming = reasoning_assembler.feed(incoming, incremental=True)
+        return StreamDelta(reasoning=incoming)
+    if event_type != "assistant":
+        return StreamDelta()
     message = evt.get("message") or {}
     if not isinstance(message, dict):
-        return ""
-    incoming = extract_text_from_content(message.get("content"))
-    return assembler.feed(incoming)
+        return StreamDelta()
+    text, reasoning = extract_parts_from_content(message.get("content"))
+    return StreamDelta(
+        content=content_assembler.feed(text),
+        reasoning=(reasoning_assembler.feed(reasoning) if reasoning_assembler is not None else reasoning),
+    )
 
 
 def extract_claude_delta(evt: dict, assembler: TextAssembler) -> str:
-    if evt.get("type") != "assistant":
-        return ""
+    return extract_claude_parts(evt, assembler).content
+
+
+def extract_claude_parts(
+    evt: dict,
+    content_assembler: TextAssembler,
+    reasoning_assembler: TextAssembler | None = None,
+) -> StreamDelta:
+    event_type = evt.get("type")
+    if event_type == "thinking":
+        incoming = evt.get("text") if isinstance(evt.get("text"), str) else ""
+        if evt.get("subtype") == "completed":
+            return StreamDelta()
+        if reasoning_assembler is not None:
+            incoming = reasoning_assembler.feed(incoming, incremental=True)
+        return StreamDelta(reasoning=incoming)
+    if event_type != "assistant":
+        return StreamDelta()
     message = evt.get("message") or {}
     if not isinstance(message, dict):
-        return ""
-    incoming = extract_text_from_content(message.get("content"))
-    return assembler.feed(incoming)
+        return StreamDelta()
+    text, reasoning = extract_parts_from_content(message.get("content"))
+    return StreamDelta(
+        content=content_assembler.feed(text),
+        reasoning=(reasoning_assembler.feed(reasoning) if reasoning_assembler is not None else reasoning),
+    )
 
 
 def extract_gemini_delta(evt: dict, assembler: TextAssembler) -> str:
+    return extract_gemini_parts(evt, assembler).content
+
+
+def extract_gemini_parts(
+    evt: dict,
+    content_assembler: TextAssembler,
+    reasoning_assembler: TextAssembler | None = None,
+) -> StreamDelta:
+    if evt.get("type") == "thinking":
+        incoming = evt.get("text") if isinstance(evt.get("text"), str) else ""
+        if reasoning_assembler is not None:
+            incoming = reasoning_assembler.feed(incoming)
+        return StreamDelta(reasoning=incoming)
     if evt.get("type") != "message":
-        return ""
+        return StreamDelta()
     if evt.get("role") != "assistant":
-        return ""
+        return StreamDelta()
     incoming = extract_text_from_content(evt.get("content"))
-    return assembler.feed(incoming)
+    reasoning = evt.get("reasoning") if isinstance(evt.get("reasoning"), str) else ""
+    return StreamDelta(
+        content=content_assembler.feed(incoming),
+        reasoning=(reasoning_assembler.feed(reasoning) if reasoning_assembler is not None else reasoning),
+    )
+
+
+def extract_codex_cli_parts(
+    evt: dict,
+    content_assembler: TextAssembler,
+    reasoning_assembler: TextAssembler | None = None,
+) -> StreamDelta:
+    if evt.get("type") != "item.completed":
+        return StreamDelta()
+    item = evt.get("item") or {}
+    if not isinstance(item, dict):
+        return StreamDelta()
+    item_type = item.get("type")
+    raw = item.get("text") if isinstance(item.get("text"), str) else ""
+    if item_type == "reasoning":
+        if reasoning_assembler is not None:
+            raw = reasoning_assembler.feed(raw)
+        return StreamDelta(reasoning=raw)
+    if item_type == "agent_message":
+        return StreamDelta(content=content_assembler.feed(raw))
+    return StreamDelta()
+
+
+def extract_codex_responses_parts(evt: dict) -> StreamDelta:
+    event_type = evt.get("type")
+    if event_type == "response.output_text.delta" and isinstance(evt.get("delta"), str):
+        return StreamDelta(content=evt["delta"])
+    if event_type == "response.output_text.done" and isinstance(evt.get("text"), str):
+        return StreamDelta(content=evt["text"])
+    if event_type in {
+        "response.reasoning_summary_text.delta",
+        "response.reasoning.delta",
+        "response.reasoning_text.delta",
+    } and isinstance(evt.get("delta"), str):
+        return StreamDelta(reasoning=evt["delta"])
+    if event_type in {
+        "response.reasoning_summary_text.done",
+        "response.reasoning.done",
+    } and isinstance(evt.get("text"), str):
+        return StreamDelta(reasoning=evt["text"])
+    if event_type == "response.reasoning_summary_part.added":
+        part = evt.get("part") or {}
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            return StreamDelta(reasoning=part["text"])
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = evt.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            summary = item.get("summary")
+            texts: list[str] = []
+            if isinstance(item.get("text"), str) and item["text"]:
+                texts.append(item["text"])
+            if isinstance(summary, list):
+                for part in summary:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]:
+                        texts.append(part["text"])
+            if texts:
+                return StreamDelta(reasoning="".join(texts))
+    return StreamDelta()
 
 
 def extract_usage_from_claude_result(evt: dict) -> dict[str, int] | None:
@@ -204,4 +375,3 @@ def extract_usage_from_gemini_result(evt: dict) -> dict[str, int] | None:
         "completion_tokens": out_tokens,
         "total_tokens": total,
     }
-
