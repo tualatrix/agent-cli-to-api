@@ -177,6 +177,58 @@ async def maybe_refresh_claude_oauth(creds_path: str) -> ClaudeOAuthCreds:
     return refreshed
 
 
+async def list_oauth_models(*, timeout_seconds: int) -> list[str]:
+    """Best-effort GET /v1/models against the configured Claude endpoint."""
+    cli_config = get_claude_cli_config()
+    if cli_config.auth_token and cli_config.base_url:
+        auth_token = cli_config.auth_token
+        base_url = cli_config.base_url
+    else:
+        creds = await maybe_refresh_claude_oauth(settings.claude_oauth_creds_path)
+        if not creds.access_token:
+            return []
+        auth_token = creds.access_token
+        base_url = settings.claude_api_base_url
+
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "x-api-key": auth_token,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "Accept": "application/json",
+    }
+    url = f"{base_url.rstrip('/')}/v1/models?limit=100"
+    client = await get_async_client("claude-models")
+    resp = await request_json_with_retries(
+        client=client,
+        method="GET",
+        url=url,
+        timeout_s=timeout_seconds,
+        headers=headers,
+    )
+    if resp.status_code < 200 or resp.status_code >= 300:
+        detail = (resp.text or "").strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "…"
+        raise RuntimeError(f"claude models failed: {resp.status_code} {detail}".strip())
+    payload = resp.json()
+    models: list[str] = []
+    items: list[Any] = []
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items = payload["data"]
+    elif isinstance(payload, list):
+        items = payload
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            models.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id") or item.get("name")
+        if isinstance(model_id, str) and model_id.strip():
+            models.append(model_id.strip())
+    return models
+
+
 def _parse_data_url(data_url: str) -> tuple[str, str] | None:
     # data:<mime>;base64,<payload>
     if not data_url.startswith("data:"):

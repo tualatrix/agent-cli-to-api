@@ -235,6 +235,48 @@ async def warmup_gemini_caches(*, timeout_seconds: int = 30) -> dict[str, str | 
     return result
 
 
+async def list_cloudcode_models(*, timeout_seconds: int) -> list[str]:
+    """Best-effort list of Gemini chat models using the CLI OAuth token."""
+    access = await get_gemini_access_token(timeout_seconds=timeout_seconds)
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Accept": "application/json",
+    }
+    url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+    client = await get_async_client("gemini-models")
+    resp = await request_json_with_retries(
+        client=client,
+        method="GET",
+        url=url,
+        timeout_s=timeout_seconds,
+        headers=headers,
+    )
+    if resp.status_code < 200 or resp.status_code >= 300:
+        detail = (resp.text or "").strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "…"
+        raise RuntimeError(f"gemini models failed: {resp.status_code} {detail}".strip())
+    payload = resp.json()
+    models: list[str] = []
+    items = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("id")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        model_id = name.strip()
+        if model_id.startswith("models/"):
+            model_id = model_id.split("/", 1)[1]
+        methods = item.get("supportedGenerationMethods") or item.get("supported_generation_methods") or []
+        if isinstance(methods, list) and methods and "generateContent" not in methods:
+            continue
+        models.append(model_id)
+    return models
+
+
 async def _refresh_access_token(
     *,
     refresh_token: str,

@@ -42,7 +42,7 @@ from .codex_responses import (
     maybe_refresh_codex_auth,
     warmup_codex_auth,
 )
-from .config import DEFAULT_CODEX_ADVERTISED_MODELS, settings
+from .config import settings
 from .claude_oauth import generate_oauth as claude_oauth_generate
 from .claude_oauth import iter_oauth_stream_events as iter_claude_oauth_events
 from .gemini_cloudcode import generate_cloudcode as gemini_cloudcode_generate
@@ -442,22 +442,88 @@ def _should_use_codex_backend(
     )
 
 
+def _known_ids_for_provider(provider: str) -> set[str]:
+    from .model_catalog import known_models
+
+    ids: set[str] = set()
+    if settings.advertised_models:
+        ids.update(settings.advertised_models)
+    else:
+        ids.update(known_models(provider if provider != "auto" else "codex"))
+        if provider == "auto":
+            for item in ("cursor-agent", "claude", "gemini"):
+                ids.update(known_models(item))
+    if settings.model_aliases:
+        ids.update(settings.model_aliases.keys())
+        ids.update(settings.model_aliases.values())
+    ids.add("default")
+    default_id = _provider_default_model(provider)
+    if default_id:
+        ids.add(default_id)
+    expanded: set[str] = set()
+    for model_id in ids:
+        raw = (model_id or "").strip()
+        if not raw:
+            continue
+        expanded.add(raw)
+        _, inner = _parse_provider_model(raw)
+        if inner:
+            expanded.add(inner)
+    return expanded
+
+
+def _should_honor_client_model(client_model: str, forced_provider: str) -> bool:
+    raw = (client_model or "").strip()
+    if not raw:
+        return False
+    if forced_provider == "auto" or settings.allow_client_model_override:
+        return True
+    if raw.lower() == "default":
+        return False
+    parsed_provider, inner = _parse_provider_model(raw)
+    candidates = {raw}
+    if inner:
+        candidates.add(inner)
+    aliased = settings.model_aliases.get(raw)
+    if aliased:
+        candidates.add(aliased)
+        _, aliased_inner = _parse_provider_model(aliased)
+        if aliased_inner:
+            candidates.add(aliased_inner)
+    if inner and settings.model_aliases.get(inner):
+        candidates.add(settings.model_aliases[inner])
+    known = _known_ids_for_provider(forced_provider)
+    if not any(candidate in known for candidate in candidates):
+        return False
+    if parsed_provider != forced_provider and parsed_provider != "codex":
+        # A prefixed model for another provider is only usable when provider override is on.
+        return bool(settings.allow_client_provider_override)
+    return True
+
+
 def _resolve_request_provider(req: ChatCompletionRequest) -> tuple[str, str | None, str]:
     forced_provider = _normalize_provider(settings.provider)
     fallback_model = (
         _provider_default_model(forced_provider if forced_provider != "auto" else "codex") or settings.default_model
     )
     client_model = (req.model or "").strip()
-    client_model_ignored = bool(forced_provider != "auto" and not settings.allow_client_model_override)
-    requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
+    honor_client = _should_honor_client_model(client_model, forced_provider)
+    requested_model = (client_model if honor_client and client_model else fallback_model).strip()
+    if requested_model.lower() == "default":
+        requested_model = fallback_model
+        honor_client = False
     resolved_model = settings.model_aliases.get(requested_model, requested_model)
     parsed_provider, provider_model = _parse_provider_model(resolved_model)
     if settings.allow_client_provider_override or forced_provider == "auto":
         provider = parsed_provider
     else:
         provider = forced_provider
-        if not settings.allow_client_model_override:
+        if not honor_client:
             provider_model = None
+        elif parsed_provider != provider:
+            provider_model = resolved_model
+    if provider_model and provider_model.lower() == "default":
+        provider_model = None
     return provider, provider_model, requested_model
 
 
@@ -1575,6 +1641,13 @@ async def _warmup_caches() -> None:
     if provider == "gemini" and settings.gemini_use_cloudcode_api:
         await warmup_gemini_caches(timeout_seconds=30)
 
+    try:
+        from .model_catalog import warmup_models
+
+        await warmup_models(provider)
+    except Exception as e:
+        logger.warning("[models-warmup] failed: %s", e)
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -1596,19 +1669,14 @@ async def healthz():
 @app.get("/models")
 async def list_models(authorization: str | None = Header(default=None)):
     _check_auth(authorization)
+    from .model_catalog import collect_advertised_models
+
     forced_provider = _normalize_provider(settings.provider)
     default_id = _provider_default_model(forced_provider) or settings.default_model
     if settings.advertised_models:
         models = settings.advertised_models[:]
-    elif forced_provider in {"auto", "codex"}:
-        models = ["default", default_id, *DEFAULT_CODEX_ADVERTISED_MODELS]
-    elif forced_provider != "auto" and not settings.allow_client_model_override:
-        # When the provider is fixed (operator-controlled), the client-sent `model` string is
-        # accepted but ignored by default, so we advertise a stable placeholder plus the
-        # provider's default model name.
-        models = ["default", default_id]
     else:
-        models = [default_id]
+        models = await collect_advertised_models(forced_provider, default_id=default_id)
     if settings.model_aliases:
         models.extend(settings.model_aliases.keys())
         models.extend(settings.model_aliases.values())
@@ -1620,9 +1688,10 @@ async def list_models(authorization: str | None = Header(default=None)):
             continue
         seen.add(m)
         unique_models.append(m)
+    owner = forced_provider if forced_provider != "auto" else "local"
     return {
         "object": "list",
-        "data": [{"id": m, "object": "model", "created": 0, "owned_by": "local"} for m in unique_models],
+        "data": [{"id": m, "object": "model", "created": 0, "owned_by": owner} for m in unique_models],
     }
 
 
@@ -1992,25 +2061,8 @@ async def chat_completions(
 
     log_mode = settings.effective_log_mode()
 
-    forced_provider = _normalize_provider(settings.provider)
-    fallback_model = (
-        _provider_default_model(forced_provider if forced_provider != "auto" else "codex") or settings.default_model
-    )
-    client_model = (req.model or "").strip()
-    # If the operator forces a provider and disallows client model override, the client-provided
-    # `model` is treated as a compatibility placeholder and ignored for backend selection.
-    client_model_ignored = bool(forced_provider != "auto" and not settings.allow_client_model_override)
-    requested_model = (fallback_model if client_model_ignored else (client_model or fallback_model)).strip()
+    provider, provider_model, requested_model = _resolve_request_provider(req)
     resolved_model = settings.model_aliases.get(requested_model, requested_model)
-    parsed_provider, provider_model = _parse_provider_model(resolved_model)
-    if settings.allow_client_provider_override or forced_provider == "auto":
-        provider = parsed_provider
-    else:
-        # Operator forces a single provider for the whole gateway; ignore request-side provider prefixes.
-        provider = forced_provider
-        if not settings.allow_client_model_override:
-            # Operator decides the provider model; ignore client-sent model strings.
-            provider_model = None
     allowed_efforts = {"low", "medium", "high", "xhigh"}
 
     def _normalize_effort(raw: str | None) -> str | None:

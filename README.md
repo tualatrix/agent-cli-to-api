@@ -109,7 +109,7 @@ uv run agent-cli-to-api codex --log-curl
 
 Notes:
 - If `CODEX_WORKSPACE` is unset, the gateway creates an empty temp workspace under `/tmp` (so you don't need to configure a repo path).
-- When you start with a fixed provider (e.g. `... gemini`), the client-sent `model` string is accepted but ignored by default (gateway uses the provider's default model).
+- When you start with a fixed provider (e.g. `... gemini`), `GET /v1/models` lists that provider's live models after connect. Selecting one of those models is honored; unknown names like `gpt-4o` still fall back to the provider default. Set `CODEX_ALLOW_CLIENT_MODEL_OVERRIDE=1` to pass through arbitrary model strings.
 - Each provider still requires its own local CLI login state (no API key is required for Codex / Gemini CloudCode / Claude OAuth).
 - **Claude auto-detects** `~/.claude/settings.json` and uses direct API mode if `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` are configured.
 - `uv run agent-cli-to-api cursor-agent` defaults to Cursor Auto routing (`CURSOR_AGENT_MODEL=auto`). If you want faster responses, run with `--preset cursor-fast`.
@@ -200,7 +200,7 @@ For advanced env vars, see `.env.example` and `codex_gateway/config.py`.
 
 - `GET /healthz`
 - `GET /debug/config` (effective runtime config; requires auth if `CODEX_GATEWAY_TOKEN` is set)
-- `GET /v1/models`
+- `GET /v1/models` (live list from the connected provider: Codex catalog, `cursor-agent --list-models`, Claude `/v1/models`, Gemini model list; falls back to a built-in catalog)
 - `POST /v1/embeddings` (proxies to OpenAI embeddings; requires `OPENAI_API_KEY` or `~/.codex/auth.json` with `OPENAI_API_KEY`)
 - `POST /v1/chat/completions` (supports `stream`)
 - `POST /v1/messages` (Anthropic Messages-compatible; supports `stream`)
