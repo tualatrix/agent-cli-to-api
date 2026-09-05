@@ -1,10 +1,15 @@
+import base64
 import unittest
+from unittest import mock
 
 from codex_gateway.claude_oauth import _content_to_anthropic_blocks
 from codex_gateway.codex_responses import convert_chat_completions_to_codex_responses
 from codex_gateway.openai_compat import (
     ChatCompletionRequest,
     ChatMessage,
+    PREVIOUS_IMAGE_OMITTED,
+    RequestInputError,
+    decode_inline_image_url,
     drop_stale_history_images,
     extract_image_urls,
     latest_user_message_has_images,
@@ -105,7 +110,10 @@ class ImageHistoryTests(unittest.TestCase):
             ]
         )
         self.assertEqual(blocks[0]["type"], "image")
-        self.assertEqual(blocks[0]["source"]["data"], "BBBNEW")
+        self.assertEqual(
+            base64.b64decode(blocks[0]["source"]["data"]),
+            decode_inline_image_url(NEW)[0],
+        )
 
     def test_extracts_popagent_mimetype_data(self) -> None:
         messages = [
@@ -124,7 +132,39 @@ class ImageHistoryTests(unittest.TestCase):
         )
         self.assertEqual(blocks[0]["type"], "image")
         self.assertEqual(blocks[0]["source"]["media_type"], "image/png")
-        self.assertEqual(blocks[0]["source"]["data"], "BBBNEW")
+        self.assertEqual(
+            base64.b64decode(blocks[0]["source"]["data"]),
+            decode_inline_image_url(NEW)[0],
+        )
+
+    def test_image_only_history_is_replaced_with_placeholder(self) -> None:
+        messages = [
+            ChatMessage(
+                role="user",
+                content=[{"type": "image_url", "image_url": {"url": OLD}}],
+            ),
+            ChatMessage(role="assistant", content="old poster"),
+            _user_image(NEW, "now this"),
+        ]
+        updated = drop_stale_history_images(messages)
+        self.assertEqual(updated[0].content, PREVIOUS_IMAGE_OMITTED)
+        self.assertEqual(extract_image_urls(updated), [NEW])
+
+    def test_remote_image_url_is_rejected(self) -> None:
+        with self.assertRaises(RequestInputError):
+            decode_inline_image_url("https://example.com/cat.png")
+
+    def test_claude_rejects_remote_and_oversized_images(self) -> None:
+        with self.assertRaises(RequestInputError):
+            _content_to_anthropic_blocks(
+                [{"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]
+            )
+        with mock.patch("codex_gateway.claude_oauth.settings") as mocked:
+            mocked.max_image_bytes = 4
+            with self.assertRaises(RequestInputError):
+                _content_to_anthropic_blocks(
+                    [{"type": "image", "mimeType": "image/png", "data": "AAAAAAAA"}]
+                )
 
     def test_prompt_with_attached_image_files_points_at_this_turn(self) -> None:
         prompt = prompt_with_attached_image_files("USER: 这个呢？", ["/tmp/images/user-image-0.png"])

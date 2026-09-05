@@ -61,6 +61,7 @@ from .openai_compat import (
     ErrorResponse,
     ResponsesRequest,
     compat_chat_request_to_chat_request,
+    decode_inline_image_url,
     drop_stale_history_images,
     extract_file_inputs,
     extract_image_urls,
@@ -506,8 +507,23 @@ def _should_honor_client_model(client_model: str, forced_provider: str) -> bool:
     return True
 
 
-def _resolve_request_provider(req: ChatCompletionRequest) -> tuple[str, str | None, str]:
+async def _ensure_known_models(forced_provider: str) -> None:
+    from .model_catalog import list_models_for_provider
+
+    if settings.advertised_models:
+        return
+    if forced_provider == "auto":
+        await asyncio.gather(
+            *(list_models_for_provider(item) for item in ("codex", "cursor-agent", "claude", "gemini")),
+            return_exceptions=True,
+        )
+        return
+    await list_models_for_provider(forced_provider)
+
+
+async def _resolve_request_provider(req: ChatCompletionRequest) -> tuple[str, str | None, str]:
     forced_provider = _normalize_provider(settings.provider)
+    await _ensure_known_models(forced_provider)
     fallback_model = (
         _provider_default_model(forced_provider if forced_provider != "auto" else "codex") or settings.default_model
     )
@@ -715,6 +731,7 @@ def _chat_completion_to_responses(chat: dict) -> dict:
     created = int(chat.get("created") or time.time())
     model = chat.get("model")
     text = ""
+    reasoning = ""
     choices = chat.get("choices") or []
     if isinstance(choices, list) and choices:
         first = choices[0]
@@ -722,6 +739,9 @@ def _chat_completion_to_responses(chat: dict) -> dict:
             message = first.get("message") or {}
             if isinstance(message, dict):
                 text = normalize_message_content(message.get("content"))
+                raw_reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+                if isinstance(raw_reasoning, str):
+                    reasoning = raw_reasoning
 
     usage_out = None
     usage = chat.get("usage")
@@ -734,18 +754,29 @@ def _chat_completion_to_responses(chat: dict) -> dict:
             "total_tokens": int(usage.get("total_tokens") or (prompt_tokens + completion_tokens)),
         }
 
-    output_msg = {
-        "id": f"msg_{uuid.uuid4().hex}",
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": text}],
-    }
+    output: list[dict] = []
+    if reasoning.strip():
+        output.append(
+            {
+                "id": f"rs_{uuid.uuid4().hex}",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }
+        )
+    output.append(
+        {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }
+    )
     resp = {
         "id": f"resp_{uuid.uuid4().hex}",
         "object": "response",
         "created": created,
         "model": model,
-        "output": [output_msg],
+        "output": output,
     }
     if usage_out is not None:
         resp["usage"] = usage_out
@@ -1492,24 +1523,7 @@ def _mime_to_ext(mime: str) -> str:
 
 
 def _decode_data_url(data_url: str) -> tuple[bytes, str]:
-    if not data_url.startswith("data:"):
-        raise ValueError("Unsupported image_url (expected data: URL)")
-    try:
-        header, payload = data_url.split(",", 1)
-    except ValueError as e:
-        raise ValueError("Invalid data: URL") from e
-
-    if ";base64" not in header:
-        raise ValueError("Unsupported data: URL encoding (expected base64)")
-
-    mime = header.removeprefix("data:").split(";", 1)[0].strip() or "application/octet-stream"
-    # base64 payload may contain newlines; strip whitespace.
-    payload = "".join(payload.split())
-    try:
-        data = base64.b64decode(payload, validate=False)
-    except Exception as e:
-        raise ValueError("Invalid base64 image payload") from e
-
+    data, mime = decode_inline_image_url(data_url, max_bytes=0)
     return data, _mime_to_ext(mime)
 
 
@@ -1842,7 +1856,7 @@ async def responses(
             status_code=400,
         )
 
-    provider, provider_model, _requested_model = _resolve_request_provider(chat_req)
+    provider, provider_model, _requested_model = await _resolve_request_provider(chat_req)
     if provider == "codex":
         image_urls = extract_image_urls(chat_req.messages)
         file_inputs = extract_file_inputs(chat_req.messages)
@@ -2084,7 +2098,7 @@ async def chat_completions(
 
     log_mode = settings.effective_log_mode()
 
-    provider, provider_model, requested_model = _resolve_request_provider(req)
+    provider, provider_model, requested_model = await _resolve_request_provider(req)
     resolved_model = settings.model_aliases.get(requested_model, requested_model)
     allowed_efforts = {"low", "medium", "high", "xhigh"}
 
@@ -3024,34 +3038,11 @@ async def chat_completions(
                                 reasoning_delta = ""
                                 if provider == "codex":
                                     if use_codex_backend:
-                                        parts = extract_codex_responses_parts(evt)
-                                        if evt.get("type") == "response.output_text.delta":
-                                            delta = _maybe_strip_answer_tags(parts.content)
-                                        elif (
-                                            not sent_content
-                                            and evt.get("type") == "response.output_text.done"
-                                        ):
-                                            delta = _maybe_strip_answer_tags(parts.content)
-                                        if parts.reasoning and (
-                                            evt.get("type")
-                                            in {
-                                                "response.reasoning_summary_text.delta",
-                                                "response.reasoning.delta",
-                                                "response.reasoning_text.delta",
-                                                "response.reasoning_summary_part.added",
-                                            }
-                                            or (
-                                                not assembled_reasoning
-                                                and evt.get("type")
-                                                in {
-                                                    "response.reasoning_summary_text.done",
-                                                    "response.reasoning.done",
-                                                    "response.output_item.added",
-                                                    "response.output_item.done",
-                                                }
-                                            )
-                                        ):
-                                            reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
+                                        parts = extract_codex_responses_parts(
+                                            evt, assembler, reasoning_assembler
+                                        )
+                                        delta = _maybe_strip_answer_tags(parts.content)
+                                        reasoning_delta = _maybe_strip_answer_tags(parts.reasoning)
                                         if evt.get("type") == "response.completed":
                                             resp = evt.get("response") or {}
                                             u = resp.get("usage") if isinstance(resp, dict) else None

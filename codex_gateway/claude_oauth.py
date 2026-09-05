@@ -19,6 +19,7 @@ from .openai_compat import (
     ChatMessage,
     RequestInputError,
     _image_url_from_part,
+    decode_inline_image_url,
     normalize_message_content,
 )
 
@@ -302,18 +303,15 @@ def _content_to_anthropic_blocks(content: object) -> list[dict[str, Any]]:
                 blocks.append({"type": "text", "text": text})
         elif t in {"image_url", "input_image", "image"}:
             url = _image_url_from_part(item)
-            if not isinstance(url, str) or not url:
-                continue
-            parsed = _parse_data_url(url)
-            if not parsed:
-                continue
-            mime, b64 = parsed
-            if len(b64) > settings.max_image_bytes * 2:
-                continue
+            data, mime = decode_inline_image_url(url or "", max_bytes=settings.max_image_bytes)
             blocks.append(
                 {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": mime, "data": b64},
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
                 }
             )
         elif t in {"file", "input_file"}:

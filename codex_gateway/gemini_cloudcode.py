@@ -15,7 +15,14 @@ from typing import Any
 
 from .config import settings
 from .http_client import get_async_client, request_json_with_retries
-from .openai_compat import ChatCompletionRequest, ChatMessage, RequestInputError, _image_url_from_part, normalize_message_content
+from .openai_compat import (
+    ChatCompletionRequest,
+    ChatMessage,
+    RequestInputError,
+    _image_url_from_part,
+    decode_inline_image_url,
+    normalize_message_content,
+)
 
 
 @dataclass(frozen=True)
@@ -652,11 +659,7 @@ def _messages_to_cloudcode_payload(
                 continue
             if ptype in {"image_url", "input_image", "image"}:
                 url = _image_url_from_part(part)
-                if not isinstance(url, str) or not url.strip():
-                    continue
-                data, mime = _decode_data_url(url)
-                if settings.max_image_bytes > 0 and len(data) > settings.max_image_bytes:
-                    raise ValueError(f"Image too large ({len(data)} bytes > {settings.max_image_bytes})")
+                data, mime = decode_inline_image_url(url or "", max_bytes=settings.max_image_bytes)
                 node["parts"].append(
                     {
                         "inlineData": {

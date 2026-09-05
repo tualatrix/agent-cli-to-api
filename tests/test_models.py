@@ -138,8 +138,11 @@ class ModelRoutingTests(unittest.TestCase):
             model="composer-2.5",
             messages=[ChatMessage(role="user", content="hi")],
         )
-        with mock.patch.object(server, "settings", settings):
-            provider, provider_model, requested_model = server._resolve_request_provider(req)
+        with mock.patch.object(server, "settings", settings), mock.patch(
+            "codex_gateway.model_catalog._fetch_cursor_models",
+            new=mock.AsyncMock(return_value=[]),
+        ):
+            provider, provider_model, requested_model = asyncio.run(server._resolve_request_provider(req))
         self.assertEqual(provider, "cursor-agent")
         self.assertEqual(provider_model, "composer-2.5")
         self.assertEqual(requested_model, "composer-2.5")
@@ -150,8 +153,11 @@ class ModelRoutingTests(unittest.TestCase):
             model="gpt-4o",
             messages=[ChatMessage(role="user", content="hi")],
         )
-        with mock.patch.object(server, "settings", settings):
-            provider, provider_model, requested_model = server._resolve_request_provider(req)
+        with mock.patch.object(server, "settings", settings), mock.patch(
+            "codex_gateway.model_catalog._fetch_cursor_models",
+            new=mock.AsyncMock(return_value=[]),
+        ):
+            provider, provider_model, requested_model = asyncio.run(server._resolve_request_provider(req))
         self.assertEqual(provider, "cursor-agent")
         self.assertIsNone(provider_model)
         self.assertEqual(requested_model, "auto")
@@ -163,10 +169,29 @@ class ModelRoutingTests(unittest.TestCase):
             messages=[ChatMessage(role="user", content="hi")],
         )
         with mock.patch.object(server, "settings", settings):
-            provider, provider_model, requested_model = server._resolve_request_provider(req)
+            provider, provider_model, requested_model = asyncio.run(server._resolve_request_provider(req))
         self.assertEqual(provider, "codex")
         self.assertEqual(provider_model, "gpt-5.6-terra")
         self.assertEqual(requested_model, "gpt-5.6-terra")
+
+    def test_live_only_model_is_honored_after_list(self) -> None:
+        settings = _settings(provider="cursor-agent", cursor_agent_model="auto")
+        live = ["auto", "composer-2.6-nightly"]
+        req = ChatCompletionRequest(
+            model="composer-2.6-nightly",
+            messages=[ChatMessage(role="user", content="hi")],
+        )
+        with mock.patch.object(server, "settings", settings), mock.patch(
+            "codex_gateway.model_catalog._fetch_cursor_models",
+            new=mock.AsyncMock(return_value=live),
+        ):
+            listed = asyncio.run(server.list_models())
+            ids = [item["id"] for item in listed["data"]]
+            self.assertIn("composer-2.6-nightly", ids)
+            provider, provider_model, requested_model = asyncio.run(server._resolve_request_provider(req))
+        self.assertEqual(provider, "cursor-agent")
+        self.assertEqual(provider_model, "composer-2.6-nightly")
+        self.assertEqual(requested_model, "composer-2.6-nightly")
 
 
 if __name__ == "__main__":

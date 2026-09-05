@@ -8,12 +8,14 @@ from codex_gateway.anthropic_compat import (
     openai_stream_to_anthropic_events,
 )
 from codex_gateway.gemini_cloudcode import _extract_parts_from_cloudcode_response
+from codex_gateway.server import _chat_completion_to_responses
 from codex_gateway.stream_json_cli import (
     TextAssembler,
     extract_claude_parts,
     extract_codex_cli_parts,
     extract_codex_responses_parts,
     extract_cursor_agent_parts,
+    extract_gemini_parts,
     extract_parts_from_content,
 )
 
@@ -112,6 +114,70 @@ class ProviderReasoningSplitTests(unittest.TestCase):
         )
         self.assertEqual(parts.reasoning, "checking files")
         self.assertEqual(parts.content, "")
+
+    def test_codex_responses_done_does_not_repeat_delta(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        first = extract_codex_responses_parts(
+            {"type": "response.reasoning_summary_text.delta", "delta": "checking files"},
+            content,
+            reasoning,
+        )
+        second = extract_codex_responses_parts(
+            {"type": "response.reasoning_summary_text.done", "text": "checking files"},
+            content,
+            reasoning,
+        )
+        third = extract_codex_responses_parts(
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "reasoning", "text": "checking files"},
+            },
+            content,
+            reasoning,
+        )
+        self.assertEqual(first.reasoning, "checking files")
+        self.assertEqual(second.reasoning, "")
+        self.assertEqual(third.reasoning, "")
+        self.assertEqual(reasoning.text, "checking files")
+
+    def test_gemini_thinking_tokens_are_incremental(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        first = extract_gemini_parts(
+            {"type": "thinking", "text": "look"},
+            content,
+            reasoning,
+        )
+        second = extract_gemini_parts(
+            {"type": "thinking", "text": " at stack"},
+            content,
+            reasoning,
+        )
+        self.assertEqual(first.reasoning, "look")
+        self.assertEqual(second.reasoning, " at stack")
+        self.assertEqual(reasoning.text, "look at stack")
+
+    def test_chat_completion_to_responses_keeps_reasoning(self) -> None:
+        converted = _chat_completion_to_responses(
+            {
+                "created": 1,
+                "model": "gpt-5.5",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "应改 StreamDownKit",
+                            "reasoning_content": "先查下划线画在哪一层",
+                        }
+                    }
+                ],
+            }
+        )
+        types = [item.get("type") for item in converted["output"]]
+        self.assertEqual(types, ["reasoning", "message"])
+        self.assertEqual(converted["output"][0]["summary"][0]["text"], "先查下划线画在哪一层")
+        self.assertEqual(converted["output"][1]["content"][0]["text"], "应改 StreamDownKit")
 
     def test_gemini_thought_parts_are_split(self) -> None:
         text, reasoning = _extract_parts_from_cloudcode_response(

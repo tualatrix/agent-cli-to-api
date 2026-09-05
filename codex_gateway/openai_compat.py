@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Literal
 
@@ -28,6 +29,9 @@ class ErrorResponse(BaseModel):
 
 class RequestInputError(ValueError):
     pass
+
+
+PREVIOUS_IMAGE_OMITTED = "[previous image omitted]"
 
 
 class ChatCompletionRequestCompat(BaseModel):
@@ -368,6 +372,59 @@ def extract_image_urls(messages: list[ChatMessage]) -> list[str]:
     return urls
 
 
+def decode_inline_image_url(url: str, *, max_bytes: int = 0) -> tuple[bytes, str]:
+    """Decode a data: image URL. Remote http(s) URLs are rejected."""
+    raw = (url or "").strip()
+    if not raw:
+        raise RequestInputError("Image part is missing a URL")
+    if raw.startswith("http://") or raw.startswith("https://"):
+        raise RequestInputError("Remote image URLs are not supported; send a data: URL")
+    if not raw.startswith("data:"):
+        raise RequestInputError("Image must be a data: URL")
+    try:
+        header, payload = raw.split(",", 1)
+    except ValueError as e:
+        raise RequestInputError("Invalid data: URL") from e
+    if ";base64" not in header:
+        raise RequestInputError("Image data URL must be base64-encoded")
+    mime = header.removeprefix("data:").split(";", 1)[0].strip() or "application/octet-stream"
+    payload = "".join(payload.split())
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        data = base64.b64decode(payload, validate=False)
+    except Exception as e:
+        raise RequestInputError("Invalid base64 image payload") from e
+    if not data:
+        raise RequestInputError("Image payload is empty")
+    if max_bytes > 0 and len(data) > max_bytes:
+        raise RequestInputError(f"Image too large ({len(data)} bytes > {max_bytes})")
+    return data, mime
+
+
+def _content_is_blank(content: Any) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, dict):
+        if _image_url_from_part(content):
+            return True
+        if content.get("type") == "text":
+            return not str(content.get("text") or "").strip()
+        return False
+    if not isinstance(content, list):
+        return not bool(content)
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if _image_url_from_part(part):
+            continue
+        if part.get("type") == "text" and not str(part.get("text") or "").strip():
+            continue
+        return False
+    return True
+
+
 def _strip_image_parts(content: Any) -> Any:
     if isinstance(content, dict):
         return "" if _image_url_from_part(content) else content
@@ -412,7 +469,11 @@ def drop_stale_history_images(messages: list[ChatMessage]) -> list[ChatMessage]:
         if idx == latest_user_with_images or not extract_image_urls_from_content(message.content):
             updated.append(message)
             continue
-        updated.append(message.model_copy(update={"content": _strip_image_parts(message.content)}))
+        stripped = _strip_image_parts(message.content)
+        if _content_is_blank(stripped):
+            updated.append(message.model_copy(update={"content": PREVIOUS_IMAGE_OMITTED}))
+        else:
+            updated.append(message.model_copy(update={"content": stripped}))
     return updated
 
 

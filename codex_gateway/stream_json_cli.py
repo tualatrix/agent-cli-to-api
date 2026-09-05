@@ -274,7 +274,7 @@ def extract_gemini_parts(
     if evt.get("type") == "thinking":
         incoming = evt.get("text") if isinstance(evt.get("text"), str) else ""
         if reasoning_assembler is not None:
-            incoming = reasoning_assembler.feed(incoming)
+            incoming = reasoning_assembler.feed(incoming, incremental=True)
         return StreamDelta(reasoning=incoming)
     if evt.get("type") != "message":
         return StreamDelta()
@@ -309,27 +309,41 @@ def extract_codex_cli_parts(
     return StreamDelta()
 
 
-def extract_codex_responses_parts(evt: dict) -> StreamDelta:
+def extract_codex_responses_parts(
+    evt: dict,
+    content_assembler: TextAssembler | None = None,
+    reasoning_assembler: TextAssembler | None = None,
+) -> StreamDelta:
+    def _content(text: str, *, incremental: bool) -> str:
+        if content_assembler is None:
+            return text
+        return content_assembler.feed(text, incremental=incremental)
+
+    def _reasoning(text: str, *, incremental: bool) -> str:
+        if reasoning_assembler is None:
+            return text
+        return reasoning_assembler.feed(text, incremental=incremental)
+
     event_type = evt.get("type")
     if event_type == "response.output_text.delta" and isinstance(evt.get("delta"), str):
-        return StreamDelta(content=evt["delta"])
+        return StreamDelta(content=_content(evt["delta"], incremental=True))
     if event_type == "response.output_text.done" and isinstance(evt.get("text"), str):
-        return StreamDelta(content=evt["text"])
+        return StreamDelta(content=_content(evt["text"], incremental=False))
     if event_type in {
         "response.reasoning_summary_text.delta",
         "response.reasoning.delta",
         "response.reasoning_text.delta",
     } and isinstance(evt.get("delta"), str):
-        return StreamDelta(reasoning=evt["delta"])
+        return StreamDelta(reasoning=_reasoning(evt["delta"], incremental=True))
     if event_type in {
         "response.reasoning_summary_text.done",
         "response.reasoning.done",
     } and isinstance(evt.get("text"), str):
-        return StreamDelta(reasoning=evt["text"])
+        return StreamDelta(reasoning=_reasoning(evt["text"], incremental=False))
     if event_type == "response.reasoning_summary_part.added":
         part = evt.get("part") or {}
         if isinstance(part, dict) and isinstance(part.get("text"), str):
-            return StreamDelta(reasoning=part["text"])
+            return StreamDelta(reasoning=_reasoning(part["text"], incremental=False))
     if event_type in {"response.output_item.added", "response.output_item.done"}:
         item = evt.get("item") or {}
         if isinstance(item, dict) and item.get("type") == "reasoning":
@@ -342,7 +356,7 @@ def extract_codex_responses_parts(evt: dict) -> StreamDelta:
                     if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]:
                         texts.append(part["text"])
             if texts:
-                return StreamDelta(reasoning="".join(texts))
+                return StreamDelta(reasoning=_reasoning("".join(texts), incremental=False))
     return StreamDelta()
 
 

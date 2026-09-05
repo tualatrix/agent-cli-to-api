@@ -84,9 +84,12 @@ def fallback_models_for(provider: str) -> list[str]:
 
 
 def known_models(provider: str) -> list[str]:
-    cached = _LAST_GOOD.get(provider)
+    cached = _CACHE.get(provider)
     if cached:
-        return list(cached)
+        return list(cached[1])
+    last_good = _LAST_GOOD.get(provider)
+    if last_good:
+        return list(last_good)
     return fallback_models_for(provider)
 
 
