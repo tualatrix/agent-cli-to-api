@@ -58,6 +58,39 @@ class TextAssemblerTests(unittest.TestCase):
         self.assertEqual(assembler.feed(" world", incremental=True), " world")
         self.assertEqual(assembler.text, "Hello world")
 
+    def test_incremental_rewritten_snapshot_does_not_duplicate(self) -> None:
+        assembler = TextAssembler()
+        first = "先对照列表长按和「分享微博」是否都走同一条只带链接的分享实现。"
+        later = "先对照列表长按和「分享微博」是否都走同一条只带链接是的。列表里长按微博后菜单里的「分享微博...」。"
+        self.assertEqual(assembler.feed(first, incremental=True), first)
+        delta = assembler.feed(later, incremental=True)
+        self.assertEqual(delta, "是的。列表里长按微博后菜单里的「分享微博...」。")
+        self.assertEqual(assembler.text, later)
+        sent = first + delta
+        self.assertEqual(assembler.unseen_since(sent), "")
+
+    def test_incremental_punctuation_rewrite_does_not_duplicate(self) -> None:
+        assembler = TextAssembler()
+        first = "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work。"
+        later = "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work工作区不在 NewLime"
+        self.assertEqual(assembler.feed(first, incremental=True), first)
+        delta = assembler.feed(later, incremental=True)
+        self.assertFalse(delta.startswith("当前会话没有绑定"))
+        self.assertEqual(assembler.text, later)
+        self.assertEqual(assembler.unseen_since(first + delta), "")
+
+    def test_unseen_since_does_not_replay_rewritten_opening(self) -> None:
+        assembler = TextAssembler()
+        first = "工作区里有一张失败现场。这是旧描述。"
+        self.assertEqual(assembler.feed(first), first)
+        later = "应改 StreamDownKit，不是 PopAgent。补上被丢掉的后半段。"
+        self.assertEqual(assembler.feed(later), "")
+        self.assertEqual(assembler.text, later)
+        # SSE cannot rewind; appending the replacement would duplicate in session.
+        self.assertEqual(assembler.unseen_since(first), "")
+        self.assertEqual(assembler.unseen_since(""), later)
+        self.assertEqual(assembler.unseen_since(later), "")
+
 
 class ProviderReasoningSplitTests(unittest.TestCase):
     def test_cursor_thinking_events_are_not_content(self) -> None:
@@ -106,6 +139,25 @@ class ProviderReasoningSplitTests(unittest.TestCase):
         self.assertEqual(first.content, opening)
         self.assertEqual(second.content, "")
         self.assertEqual(content.text, opening)
+
+    def test_cursor_result_emits_unseen_suffix(self) -> None:
+        content = TextAssembler()
+        opening = "如果这里能一行行出 data: ...，就是 client 没消费 SSE（或打到了 /v1/responses）。"
+        rest = "如果这里也是等很久再一大坨，就是当前 provider 模式本身不够细。"
+        first = extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": opening}]},
+            },
+            content,
+        )
+        done = extract_cursor_agent_parts(
+            {"type": "result", "result": opening + rest},
+            content,
+        )
+        self.assertEqual(first.content, opening)
+        self.assertEqual(done.content, rest)
+        self.assertEqual(content.text, opening + rest)
 
     def test_assistant_thinking_blocks_are_split(self) -> None:
         text, thinking = extract_parts_from_content(

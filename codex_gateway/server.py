@@ -67,6 +67,7 @@ from .openai_compat import (
     extract_image_urls,
     latest_user_message_has_images,
     messages_to_prompt,
+    trim_messages_to_prompt_budget,
     normalize_message_content,
     prompt_with_attached_image_files,
     RequestInputError,
@@ -1489,6 +1490,24 @@ def _looks_like_automation_prompt(prompt: str) -> bool:
     return any(m in p for m in markers)
 
 
+def _apply_prompt_budget(messages: list[ChatMessage], *, resp_id: str | None = None) -> list[ChatMessage]:
+    before_chars = len(messages_to_prompt(messages))
+    trimmed = trim_messages_to_prompt_budget(messages, settings.max_prompt_chars)
+    after_chars = len(messages_to_prompt(trimmed))
+    if after_chars != before_chars or len(trimmed) != len(messages):
+        prefix = f"[{resp_id}] " if resp_id else ""
+        logger.info(
+            "%strimmed prompt history messages=%d->%d chars=%d->%d budget=%d",
+            prefix,
+            len(messages),
+            len(trimmed),
+            before_chars,
+            after_chars,
+            settings.max_prompt_chars,
+        )
+    return trimmed
+
+
 def _maybe_inject_automation_guard(prompt: str) -> str:
     if not prompt:
         return prompt
@@ -1765,6 +1784,7 @@ async def debug_config(authorization: str | None = Header(default=None)):
         "use_codex_responses_api": settings.use_codex_responses_api,
         "codex_cli_home": settings.codex_cli_home,
         "workspace": settings.workspace,
+        "max_prompt_chars": settings.max_prompt_chars,
         "max_concurrency": settings.max_concurrency,
         "timeout_seconds": settings.timeout_seconds,
         "subprocess_stream_limit": settings.subprocess_stream_limit,
@@ -1847,7 +1867,9 @@ async def responses(
     global _active_requests
     _check_auth(authorization)
     chat_req = responses_request_to_chat_request(req)
-    chat_req = chat_req.model_copy(update={"messages": drop_stale_history_images(chat_req.messages)})
+    chat_req = chat_req.model_copy(
+        update={"messages": _apply_prompt_budget(drop_stale_history_images(chat_req.messages))}
+    )
     if not chat_req.messages:
         return _openai_error("Missing input for responses request", status_code=422)
     if chat_req.stream:
@@ -2094,7 +2116,9 @@ async def chat_completions(
         req = compat_chat_request_to_chat_request(req)
     except ValueError as e:
         return _openai_error(str(e), status_code=422)
-    req = req.model_copy(update={"messages": drop_stale_history_images(req.messages)})
+    req = req.model_copy(
+        update={"messages": _apply_prompt_budget(drop_stale_history_images(req.messages))}
+    )
 
     log_mode = settings.effective_log_mode()
 
@@ -2966,6 +2990,7 @@ async def chat_completions(
                         reasoning_assembler = TextAssembler()
                         sent_content = False
                         should_retry = False
+                        ended_cleanly = False
 
                         async def _pump_events() -> None:
                             try:
@@ -2993,6 +3018,7 @@ async def chat_completions(
                                     continue
 
                                 if evt is None:
+                                    ended_cleanly = True
                                     break
 
                                 if isinstance(evt, dict) and evt.get("_gateway_error"):
@@ -3064,6 +3090,7 @@ async def chat_completions(
                                                 parsed_calls = extract_codex_tool_calls(resp)
                                                 if parsed_calls:
                                                     stream_tool_calls = parsed_calls
+                                            ended_cleanly = True
                                             break
                                     else:
                                         parts = extract_codex_cli_parts(evt, assembler, reasoning_assembler)
@@ -3141,6 +3168,26 @@ async def chat_completions(
                             pump_task.cancel()
                             with suppress(asyncio.CancelledError):
                                 await pump_task
+
+                        if ended_cleanly:
+                            leftover = _maybe_strip_answer_tags(assembler.unseen_since(assembled_text))
+                            if leftover:
+                                sent_content = True
+                                assembled_text += leftover
+                                if settings.log_stream_inline:
+                                    _stream_inline_append(resp_id, leftover)
+                                elif settings.log_stream_deltas:
+                                    logger.info("[%s] stream delta: %s", resp_id, _inline_log_text(leftover))
+                                chunk = {
+                                    "id": resp_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": requested_model,
+                                    "choices": [
+                                        {"index": 0, "delta": {"content": leftover}, "finish_reason": None}
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                         if should_retry:
                             continue

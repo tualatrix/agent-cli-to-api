@@ -46,8 +46,9 @@ class TextAssembler:
                 return delta
             if self.text.startswith(incoming):
                 return ""
-            self.text += incoming
-            return incoming
+            # Cursor --stream-partial-output often labels a rewritten snapshot
+            # as subtype=delta. Concatenating that snapshot repeats the opening.
+            incremental = False
         if incoming.startswith(self.text):
             delta = incoming[len(self.text) :]
             self.text = incoming
@@ -73,6 +74,23 @@ class TextAssembler:
             return incoming[common:] if common else ""
         self.text += incoming
         return incoming
+
+    def unseen_since(self, already_sent: str) -> str:
+        """Return text that was assembled but never yielded as an SSE delta."""
+        latest = self.text or ""
+        already_sent = already_sent or ""
+        if not latest or latest == already_sent:
+            return ""
+        if not already_sent:
+            return latest
+        if latest.startswith(already_sent):
+            return latest[len(already_sent) :]
+        if already_sent.startswith(latest):
+            return ""
+        # A rewritten snapshot was stored without a shared prefix, or the
+        # client already received an old opening plus a new suffix. Dumping
+        # latest[common:] here repeats sentences in the session log.
+        return ""
 
 
 def _common_prefix_len(left: str, right: str) -> int:
@@ -216,6 +234,17 @@ def extract_parts_from_content(content: object) -> tuple[str, str]:
     return "".join(text_parts), "".join(reasoning_parts)
 
 
+def _feed_final_result(assembler: TextAssembler, result: object) -> str:
+    if not isinstance(result, str) or not result:
+        return ""
+    current = assembler.text or ""
+    if current and not (
+        result.startswith(current) or current in result or len(result) >= len(current)
+    ):
+        return ""
+    return assembler.feed(result)
+
+
 def extract_cursor_agent_delta(evt: dict, assembler: TextAssembler) -> str:
     return extract_cursor_agent_parts(evt, assembler).content
 
@@ -233,6 +262,8 @@ def extract_cursor_agent_parts(
         if reasoning_assembler is not None:
             incoming = reasoning_assembler.feed(incoming, incremental=True)
         return StreamDelta(reasoning=incoming)
+    if event_type == "result":
+        return StreamDelta(content=_feed_final_result(content_assembler, evt.get("result")))
     if event_type != "assistant":
         return StreamDelta()
     message = evt.get("message") or {}
@@ -267,6 +298,8 @@ def extract_claude_parts(
         if reasoning_assembler is not None:
             incoming = reasoning_assembler.feed(incoming, incremental=True)
         return StreamDelta(reasoning=incoming)
+    if event_type == "result":
+        return StreamDelta(content=_feed_final_result(content_assembler, evt.get("result")))
     if event_type != "assistant":
         return StreamDelta()
     message = evt.get("message") or {}

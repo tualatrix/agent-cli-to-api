@@ -32,6 +32,7 @@ class RequestInputError(ValueError):
 
 
 PREVIOUS_IMAGE_OMITTED = "[previous image omitted]"
+EARLIER_CONVERSATION_OMITTED = "[earlier conversation omitted]"
 
 
 class ChatCompletionRequestCompat(BaseModel):
@@ -295,6 +296,97 @@ def messages_to_prompt(messages: list[ChatMessage]) -> str:
         text = normalize_message_content(message.content)
         parts.append(f"{role}: {text}")
     return "\n\n".join(parts).strip()
+
+
+def _set_message_text(message: ChatMessage, text: str) -> ChatMessage:
+    content = message.content
+    if isinstance(content, list):
+        replaced = False
+        new_parts: list[Any] = []
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and not replaced
+            ):
+                new_parts.append({**part, "text": text})
+                replaced = True
+            elif isinstance(part, dict):
+                new_parts.append(part)
+        if not replaced:
+            new_parts.insert(0, {"type": "text", "text": text})
+        return message.model_copy(update={"content": new_parts})
+    return message.model_copy(update={"content": text})
+
+
+def _truncate_text_to_budget(messages: list[ChatMessage], max_chars: int) -> list[ChatMessage]:
+    updated = list(messages)
+    for idx, message in enumerate(updated):
+        prompt = messages_to_prompt(updated)
+        if len(prompt) <= max_chars:
+            return updated
+        overflow = len(prompt) - max_chars
+        text = normalize_message_content(message.content)
+        if not text:
+            continue
+        keep = max(len(text) - overflow - len("\n... (truncated)"), 0)
+        if keep == 0:
+            updated[idx] = _set_message_text(message, "")
+        else:
+            updated[idx] = _set_message_text(message, f"{text[:keep]}\n... (truncated)")
+    return updated
+
+
+def trim_messages_to_prompt_budget(
+    messages: list[ChatMessage],
+    max_chars: int,
+) -> list[ChatMessage]:
+    """Drop oldest chat turns, then truncate text, so the flattened prompt fits.
+
+    Chat clients resend the full transcript. Resuming a long thread can exceed
+    CODEX_MAX_PROMPT_CHARS; keep system/developer prefixes and the newest turns.
+    """
+    if max_chars <= 0 or not messages:
+        return messages
+    if len(messages_to_prompt(messages)) <= max_chars:
+        return messages
+
+    pinned: list[ChatMessage] = []
+    rest: list[ChatMessage] = []
+    pinning = True
+    for message in messages:
+        if pinning and message.role in {"system", "developer"}:
+            pinned.append(message)
+            continue
+        pinning = False
+        rest.append(message)
+
+    if not rest:
+        return _truncate_text_to_budget(pinned, max_chars)
+
+    def _candidate(start: int) -> list[ChatMessage]:
+        out = list(pinned)
+        if start > 0:
+            out.append(ChatMessage(role="system", content=EARLIER_CONVERSATION_OMITTED))
+        out.extend(rest[start:])
+        return out
+
+    left = 0
+    right = len(rest) - 1
+    chosen = len(rest) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if len(messages_to_prompt(_candidate(mid))) <= max_chars:
+            chosen = mid
+            right = mid - 1
+        else:
+            left = mid + 1
+
+    best = _candidate(chosen)
+    if len(messages_to_prompt(best)) <= max_chars:
+        return best
+    return _truncate_text_to_budget(best, max_chars)
 
 
 def _image_url_from_part(part: dict[str, Any]) -> str | None:
