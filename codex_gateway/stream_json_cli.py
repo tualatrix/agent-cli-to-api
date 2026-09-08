@@ -28,52 +28,89 @@ class TextAssembler:
     """
     Some CLIs emit partial deltas and later emit a full final message.
     This helper turns mixed streams into clean deltas (and a final assembled text).
+
+    ``journal=True`` is for thinking / status lines: each new event is a
+    paragraph, not a rewrite of one document. Cursor concatenates those
+    lines without newlines; we reinsert the breaks on emit.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, journal: bool = False) -> None:
         self.text = ""
+        self.raw = ""
+        self.journal = journal
 
     def feed(self, incoming: str, *, incremental: bool = False) -> str:
         incoming = incoming or ""
         if not incoming:
             return ""
-        if incoming == self.text:
+        if incoming == self.raw or incoming == self.text:
             return ""
         if incremental:
-            if incoming.startswith(self.text):
-                delta = incoming[len(self.text) :]
-                self.text = incoming
-                return delta
-            if self.text.startswith(incoming):
+            if incoming.startswith(self.raw):
+                return self._extend_raw(incoming)
+            if self.raw.startswith(incoming):
                 return ""
             # Cursor --stream-partial-output often labels a rewritten snapshot
             # as subtype=delta. Concatenating that snapshot repeats the opening.
             incremental = False
-        if incoming.startswith(self.text):
-            delta = incoming[len(self.text) :]
-            self.text = incoming
-            return delta
-        if self.text.startswith(incoming):
+        if incoming.startswith(self.raw):
+            return self._extend_raw(incoming)
+        if self.raw.startswith(incoming):
             # Older / shorter snapshot of text we already assembled.
             return ""
-        if self.text and self.text in incoming:
-            prefix, _, suffix = incoming.partition(self.text)
+        if self.raw and self.raw in incoming:
+            # Cursor's terminal `result` concatenates every assistant segment,
+            # including pre-tool narration. Only take a trailing extension.
+            suffix = incoming[incoming.index(self.raw) + len(self.raw) :]
+            if not suffix:
+                return ""
+            return self._extend_raw(self.raw + suffix)
+        if self.journal:
+            if _is_token_crumb(incoming):
+                return self._extend_raw(self.raw + incoming)
+            return self._append_paragraph(incoming)
+        if (
+            self.raw
+            and incoming.lstrip().startswith("当前会话没有绑定")
+            and not self.raw.lstrip().startswith("当前会话没有绑定")
+        ):
+            return ""
+        common = _common_prefix_len(self.raw, incoming)
+        looks_like_snapshot = _looks_like_snapshot(incoming)
+        if self.raw and (looks_like_snapshot or common >= min(len(self.raw), 16)):
+            if len(incoming) < len(self.raw):
+                # Stale earlier draft that shares an opening (often the
+                # TutuStudio notice). Do not append that draft's suffix.
+                return ""
+            # Rewrite. SSE cannot rewind the old unique suffix, so emitting
+            # incoming[common:] pastes the new tail onto the old draft.
+            self.raw = incoming
             self.text = incoming
-            return f"{prefix}{suffix}"
-        common = _common_prefix_len(self.text, incoming)
-        # Later assistant/thinking events often resend a near-complete snapshot.
-        # SSE clients cannot rewind, so only emit the unseen suffix. A full
-        # replacement with no shared prefix is stored but not re-streamed.
-        looks_like_snapshot = (
-            "\n" in incoming
-            or incoming.endswith(("。", "！", "？", ".", "!", "?", "\n"))
-            or len(incoming) > 80
-        )
-        if self.text and (looks_like_snapshot or common >= min(len(self.text), 16)):
-            self.text = incoming
-            return incoming[common:] if common else ""
-        self.text += incoming
+            return ""
+        # Short crumb with no shared prefix: true token increment.
+        if self.raw and not looks_like_snapshot and len(incoming) < 40:
+            return self._extend_raw(self.raw + incoming)
+        if self.raw:
+            return ""
+        self.raw = incoming
+        self.text = incoming
         return incoming
+
+    def _extend_raw(self, incoming: str) -> str:
+        delta = incoming[len(self.raw) :]
+        self.raw = incoming
+        if not delta:
+            return ""
+        if _needs_paragraph_break(self.text, delta):
+            delta = "\n\n" + delta
+        self.text += delta
+        return delta
+
+    def _append_paragraph(self, incoming: str) -> str:
+        self.raw = incoming
+        delta = incoming if not self.text else "\n\n" + incoming
+        self.text += delta
+        return delta
 
     def unseen_since(self, already_sent: str) -> str:
         """Return text that was assembled but never yielded as an SSE delta."""
@@ -87,10 +124,107 @@ class TextAssembler:
             return latest[len(already_sent) :]
         if already_sent.startswith(latest):
             return ""
-        # A rewritten snapshot was stored without a shared prefix, or the
-        # client already received an old opening plus a new suffix. Dumping
-        # latest[common:] here repeats sentences in the session log.
-        return ""
+        if latest in already_sent:
+            return ""
+        # A mid-stream rewrite was stored silently. Emit the last snapshot
+        # once so the client is not left with a cut-off draft. Prefix a
+        # paragraph break so the old tail and new draft are not jammed.
+        return "\n\n" + latest
+
+
+_NEW_THOUGHT_STARTS = (
+    "正在",
+    "准备",
+    "接下来",
+    "接着",
+    "先看",
+    "先在",
+    "先对",
+    "用户",
+    "重点",
+    "同时",
+    "需要",
+    "当前",
+    "工作区",
+    "现在",
+    "确认",
+    "发现",
+    "评审",
+    "验证",
+    "重新",
+    "根评",
+    "未纳入",
+    "未提交",
+    "The ",
+    "I ",
+    "I'll ",
+    "Reviewing",
+    "Checking",
+    "Looking",
+    "Reading",
+    "Let ",
+    "Now ",
+    "Got ",
+    "No ",
+    "Will ",
+    "Starting",
+    "**",
+    "- ",
+)
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x3400 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+        or 0x20000 <= code <= 0x2CEAF
+    )
+
+
+def _looks_like_snapshot(text: str) -> bool:
+    if not text:
+        return False
+    if "\n" in text or len(text) > 80:
+        return True
+    if text.endswith(("。", "！", "？", ".", "!", "?", "\n", "…")):
+        return True
+    # Cursor often cuts a rewrite before the trailing period, e.g.
+    # "重新编译后再进那条 4 条回复的楼层看一眼。当前会话"
+    return any(mark in text for mark in ("。", "！", "？"))
+
+
+def _looks_like_new_sentence(text: str) -> bool:
+    stripped = text.lstrip()
+    return bool(stripped) and stripped.startswith(_NEW_THOUGHT_STARTS)
+
+
+def _is_token_crumb(text: str) -> bool:
+    if _looks_like_snapshot(text) or _looks_like_new_sentence(text):
+        return False
+    # A 20–40 char Chinese clause is a snapshot, not a token. English crumbs
+    # like " world" stay below this CJK threshold.
+    if sum(1 for char in text if _is_cjk(char)) >= 8:
+        return False
+    return 0 < len(text) < 40
+
+
+def _needs_paragraph_break(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left[-1].isspace() or right[0].isspace():
+        return False
+    if right[0] in ".,;:!?。，、；：！？)]｝》'\"":
+        return False
+    if left.rstrip().endswith(("。", "！", "？", ".", "!", "?", "…", "：", ":", "`")):
+        return True
+    if _looks_like_new_sentence(right):
+        return True
+    if _is_cjk(left[-1]) != _is_cjk(right[0]):
+        return True
+    if left[-1].isalpha() and right[0].isupper() and right[0].isascii():
+        return True
+    return False
 
 
 def _common_prefix_len(left: str, right: str) -> int:
@@ -231,18 +365,68 @@ def extract_parts_from_content(content: object) -> tuple[str, str]:
             continue
         if part_type == "text" and isinstance(part.get("text"), str):
             text_parts.append(part["text"])
-    return "".join(text_parts), "".join(reasoning_parts)
+    return "".join(text_parts), "\n\n".join(reasoning_parts)
 
 
 def _feed_final_result(assembler: TextAssembler, result: object) -> str:
     if not isinstance(result, str) or not result:
         return ""
-    current = assembler.text or ""
-    if current and not (
-        result.startswith(current) or current in result or len(result) >= len(current)
-    ):
+    current = assembler.raw or assembler.text or ""
+    if not current:
+        state = getattr(assembler, "_cursor_stream", None)
+        if isinstance(state, _CursorStreamState) and state.saw_tool:
+            # Concatenated result still starts with pre-tool narration.
+            return ""
+        return assembler.feed(result)
+    if result.startswith(current):
+        return assembler.feed(result)
+    # Last segment only: narration + answer, current is the answer (or a prefix).
+    idx = result.rfind(current)
+    if idx >= 0:
+        return assembler.feed(result[idx:])
+    return ""
+
+
+def flush_cursor_held_content(assembler: TextAssembler) -> str:
+    return _flush_held_cursor_complete(assembler)
+
+
+# First assistant segment before a tool is usually "I'll open the file".
+# Hold it so Cursor's concatenated `result` cannot paste it into content.
+# Start streaming once the segment is clearly a real answer with no tool yet.
+_CURSOR_PRE_TOOL_HOLD_CHARS = 320
+
+
+@dataclass
+class _CursorStreamState:
+    saw_timestamp: bool = False
+    held_complete: str = ""
+    saw_tool: bool = False
+
+
+def _cursor_stream_state(assembler: TextAssembler) -> _CursorStreamState:
+    state = getattr(assembler, "_cursor_stream", None)
+    if not isinstance(state, _CursorStreamState):
+        state = _CursorStreamState()
+        assembler._cursor_stream = state
+    return state
+
+
+def _cursor_assistant_is_duplicate(evt: dict, state: _CursorStreamState) -> bool:
+    if evt.get("model_call_id"):
+        return True
+    if state.saw_timestamp and evt.get("timestamp_ms") is None and evt.get("subtype") != "delta":
+        return True
+    return False
+
+
+def _flush_held_cursor_complete(assembler: TextAssembler) -> str:
+    state = _cursor_stream_state(assembler)
+    held = state.held_complete
+    state.held_complete = ""
+    if not held:
         return ""
-    return assembler.feed(result)
+    return assembler.feed(held)
 
 
 def extract_cursor_agent_delta(evt: dict, assembler: TextAssembler) -> str:
@@ -255,30 +439,82 @@ def extract_cursor_agent_parts(
     reasoning_assembler: TextAssembler | None = None,
 ) -> StreamDelta:
     event_type = evt.get("type")
+    state = _cursor_stream_state(content_assembler)
     if event_type == "thinking":
         if evt.get("subtype") == "completed":
             return StreamDelta()
         incoming = evt.get("text") if isinstance(evt.get("text"), str) else ""
         if reasoning_assembler is not None:
+            reasoning_assembler.journal = True
             incoming = reasoning_assembler.feed(incoming, incremental=True)
         return StreamDelta(reasoning=incoming)
+    if event_type == "tool_call":
+        held = state.held_complete
+        state.held_complete = ""
+        state.saw_tool = True
+        if not held:
+            held = content_assembler.text
+            content_assembler.text = ""
+            content_assembler.raw = ""
+        if held:
+            if reasoning_assembler is None:
+                return StreamDelta(reasoning=held)
+            if held in (reasoning_assembler.text or ""):
+                return StreamDelta()
+            reasoning_assembler.journal = True
+            return StreamDelta(reasoning=reasoning_assembler.feed(held))
+        return StreamDelta()
     if event_type == "result":
-        return StreamDelta(content=_feed_final_result(content_assembler, evt.get("result")))
+        content = _flush_held_cursor_complete(content_assembler)
+        content += _feed_final_result(content_assembler, evt.get("result"))
+        return StreamDelta(content=content)
     if event_type != "assistant":
+        return StreamDelta()
+    if _cursor_assistant_is_duplicate(evt, state):
         return StreamDelta()
     message = evt.get("message") or {}
     if not isinstance(message, dict):
         return StreamDelta()
     text, reasoning = extract_parts_from_content(message.get("content"))
-    incremental = evt.get("subtype") == "delta"
-    return StreamDelta(
-        content=content_assembler.feed(text, incremental=incremental),
-        reasoning=(
-            reasoning_assembler.feed(reasoning, incremental=incremental)
-            if reasoning_assembler is not None
-            else reasoning
-        ),
+    incremental = evt.get("subtype") == "delta" or evt.get("timestamp_ms") is not None
+    if evt.get("timestamp_ms") is not None:
+        state.saw_timestamp = True
+    reasoning_delta = (
+        reasoning_assembler.feed(reasoning, incremental=incremental)
+        if reasoning_assembler is not None
+        else reasoning
     )
+    if incremental:
+        if not state.saw_tool:
+            if text and (
+                not state.held_complete
+                or text.startswith(state.held_complete)
+                or len(text) >= len(state.held_complete)
+            ):
+                state.held_complete = text
+            if len(state.held_complete) < _CURSOR_PRE_TOOL_HOLD_CHARS:
+                return StreamDelta(reasoning=reasoning_delta)
+        prior = _flush_held_cursor_complete(content_assembler)
+        return StreamDelta(
+            content=prior + content_assembler.feed(text, incremental=True),
+            reasoning=reasoning_delta,
+        )
+    # Complete assistant message (one per tool-call gap). Hold it: a following
+    # tool_call means this was narration, not the final answer.
+    if (
+        reasoning_assembler is not None
+        and text
+        and text in (reasoning_assembler.text or "")
+    ):
+        return StreamDelta(reasoning=reasoning_delta)
+    if (
+        state.held_complete
+        and len(text) < len(state.held_complete)
+        and _common_prefix_len(text, state.held_complete) >= 16
+    ):
+        return StreamDelta(reasoning=reasoning_delta)
+    state.held_complete = text
+    return StreamDelta(reasoning=reasoning_delta)
 
 
 def extract_claude_delta(evt: dict, assembler: TextAssembler) -> str:
@@ -296,6 +532,7 @@ def extract_claude_parts(
         if evt.get("subtype") == "completed":
             return StreamDelta()
         if reasoning_assembler is not None:
+            reasoning_assembler.journal = True
             incoming = reasoning_assembler.feed(incoming, incremental=True)
         return StreamDelta(reasoning=incoming)
     if event_type == "result":

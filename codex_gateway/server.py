@@ -82,6 +82,7 @@ from .stream_json_cli import (
     extract_gemini_parts,
     extract_usage_from_claude_result,
     extract_usage_from_gemini_result,
+    flush_cursor_held_content,
     iter_stream_json_events,
 )
 
@@ -3170,6 +3171,8 @@ async def chat_completions(
                                 await pump_task
 
                         if ended_cleanly:
+                            if provider == "cursor-agent":
+                                flush_cursor_held_content(assembler)
                             leftover = _maybe_strip_answer_tags(assembler.unseen_since(assembled_text))
                             if leftover:
                                 sent_content = True

@@ -58,38 +58,107 @@ class TextAssemblerTests(unittest.TestCase):
         self.assertEqual(assembler.feed(" world", incremental=True), " world")
         self.assertEqual(assembler.text, "Hello world")
 
-    def test_incremental_rewritten_snapshot_does_not_duplicate(self) -> None:
+    def test_incremental_rewritten_snapshot_does_not_glue_old_suffix(self) -> None:
         assembler = TextAssembler()
         first = "先对照列表长按和「分享微博」是否都走同一条只带链接的分享实现。"
         later = "先对照列表长按和「分享微博」是否都走同一条只带链接是的。列表里长按微博后菜单里的「分享微博...」。"
         self.assertEqual(assembler.feed(first, incremental=True), first)
-        delta = assembler.feed(later, incremental=True)
-        self.assertEqual(delta, "是的。列表里长按微博后菜单里的「分享微博...」。")
+        # Mid-string rewrite must not emit later[common:] onto the old suffix.
+        self.assertEqual(assembler.feed(later, incremental=True), "")
         self.assertEqual(assembler.text, later)
-        sent = first + delta
-        self.assertEqual(assembler.unseen_since(sent), "")
+        self.assertEqual(assembler.unseen_since(first), "\n\n" + later)
 
-    def test_incremental_punctuation_rewrite_does_not_duplicate(self) -> None:
+    def test_incremental_punctuation_rewrite_does_not_glue_old_suffix(self) -> None:
         assembler = TextAssembler()
         first = "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work。"
         later = "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work工作区不在 NewLime"
         self.assertEqual(assembler.feed(first, incremental=True), first)
-        delta = assembler.feed(later, incremental=True)
-        self.assertFalse(delta.startswith("当前会话没有绑定"))
+        self.assertEqual(assembler.feed(later, incremental=True), "")
         self.assertEqual(assembler.text, later)
-        self.assertEqual(assembler.unseen_since(first + delta), "")
+        self.assertEqual(assembler.unseen_since(first), "\n\n" + later)
 
-    def test_unseen_since_does_not_replay_rewritten_opening(self) -> None:
+    def test_unseen_since_emits_rewritten_snapshot_at_end(self) -> None:
         assembler = TextAssembler()
         first = "工作区里有一张失败现场。这是旧描述。"
         self.assertEqual(assembler.feed(first), first)
         later = "应改 StreamDownKit，不是 PopAgent。补上被丢掉的后半段。"
         self.assertEqual(assembler.feed(later), "")
         self.assertEqual(assembler.text, later)
-        # SSE cannot rewind; appending the replacement would duplicate in session.
-        self.assertEqual(assembler.unseen_since(first), "")
+        self.assertEqual(assembler.unseen_since(first), "\n\n" + later)
         self.assertEqual(assembler.unseen_since(""), later)
         self.assertEqual(assembler.unseen_since(later), "")
+
+    def test_late_short_notice_does_not_replace_long_answer(self) -> None:
+        assembler = TextAssembler()
+        answer = (
+            "不完全是必须二选一，但启动、恢复、外部打开这三件事必须只有一个主人。"
+            "现在出问题的正是这层混用，不是 Diagnostics 窗口本身用了 SwiftUI。"
+        )
+        notice = "当前会话没有绑定 TutuStudio Task，本轮不会记到 Work。要记录的话先发任务编号或 `@newtask` / `新"
+        self.assertEqual(assembler.feed(answer), answer)
+        self.assertEqual(assembler.feed(notice), "")
+        self.assertEqual(assembler.text, answer)
+        self.assertEqual(assembler.unseen_since(answer), "")
+
+    def test_smashed_prefix_extension_inserts_paragraph_break(self) -> None:
+        assembler = TextAssembler()
+        first = "工作区里有 8 个改动文件"
+        later = first + "`macOS/Localizable.xcstrings` 仍是无关抽取。"
+        self.assertEqual(assembler.feed(first), first)
+        self.assertEqual(assembler.feed(later), "\n\n`macOS/Localizable.xcstrings` 仍是无关抽取。")
+        self.assertEqual(assembler.text, first + "\n\n`macOS/Localizable.xcstrings` 仍是无关抽取。")
+
+    def test_rewritten_leftover_is_separated_from_old_draft(self) -> None:
+        assembler = TextAssembler()
+        first = "评审通过：诊断窗外壳与 Store/HUD 同一套 AppKit 所有权，剩余 Swift"
+        later = (
+            "评审没有阻塞问题，已提交到 `main`："
+            "实现一致。`standardSessionWindowLeavesSwiftUIWindowGroup` 已通过。"
+        )
+        self.assertEqual(assembler.feed(first), first)
+        self.assertEqual(assembler.feed(later), "")
+        self.assertEqual(assembler.unseen_since(first), "\n\n" + later)
+
+    def test_thinking_journal_keeps_status_lines_apart(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        first = extract_cursor_agent_parts(
+            {"type": "thinking", "subtype": "delta", "text": "准备改用 Shell"},
+            content,
+            reasoning,
+        )
+        second = extract_cursor_agent_parts(
+            {"type": "thinking", "subtype": "delta", "text": "正在检查 macOS 诊断窗口的实现。"},
+            content,
+            reasoning,
+        )
+        self.assertEqual(first.reasoning, "准备改用 Shell")
+        self.assertEqual(second.reasoning, "\n\n正在检查 macOS 诊断窗口的实现。")
+        self.assertEqual(
+            reasoning.text,
+            "准备改用 Shell\n\n正在检查 macOS 诊断窗口的实现。",
+        )
+
+    def test_chinese_clause_is_not_glued_as_token_crumb(self) -> None:
+        assembler = TextAssembler()
+        first = (
+            "根评论时间旁已能显示 `source`，回复页和楼层用的 `StatusComment` 没画出来。"
+            "微博正文用的是 `region_name`，评论接口多半也有。接下来把该"
+        )
+        clause = "重新编译后再进那条 4 条回复的楼层看一眼。当前会话"
+        fragment = (
+            " `region_name`（和微博正文同一套，例如「发布于 华盛顿」）\n"
+            "- 没有 `region_name` "
+        )
+        self.assertEqual(assembler.feed(first), first)
+        self.assertEqual(assembler.feed(first + "评论接口里本来就有位置字段，回复页只画"), "评论接口里本来就有位置字段，回复页只画")
+        # A cut-off later draft must not be treated as the next few tokens.
+        self.assertEqual(assembler.feed(clause, incremental=True), "")
+        self.assertEqual(assembler.feed(fragment, incremental=True), "")
+        self.assertEqual(assembler.feed(clause, incremental=True), "")
+        self.assertNotIn("重新编译后再进", assembler.text)
+        self.assertNotIn("发布于 华盛顿", assembler.text)
+        self.assertTrue(assembler.text.startswith("根评论时间旁已能显示"))
 
 
 class ProviderReasoningSplitTests(unittest.TestCase):
@@ -101,7 +170,7 @@ class ProviderReasoningSplitTests(unittest.TestCase):
             content,
             reasoning,
         )
-        answer = extract_cursor_agent_parts(
+        extract_cursor_agent_parts(
             {
                 "type": "assistant",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "应改 StreamDownKit"}]},
@@ -109,10 +178,14 @@ class ProviderReasoningSplitTests(unittest.TestCase):
             content,
             reasoning,
         )
+        done = extract_cursor_agent_parts(
+            {"type": "result", "result": "应改 StreamDownKit"},
+            content,
+            reasoning,
+        )
         self.assertEqual(thinking.content, "")
         self.assertEqual(thinking.reasoning, "先读图再回答")
-        self.assertEqual(answer.content, "应改 StreamDownKit")
-        self.assertEqual(answer.reasoning, "")
+        self.assertEqual(done.content, "应改 StreamDownKit")
         self.assertEqual(content.text, "应改 StreamDownKit")
         self.assertEqual(reasoning.text, "先读图再回答")
 
@@ -120,7 +193,7 @@ class ProviderReasoningSplitTests(unittest.TestCase):
         content = TextAssembler()
         reasoning = TextAssembler()
         opening = "当前会话没有绑定 TutuStudio Task，本轮不会记到 Work。我先查 steer。"
-        first = extract_cursor_agent_parts(
+        extract_cursor_agent_parts(
             {
                 "type": "assistant",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": opening}]},
@@ -128,7 +201,7 @@ class ProviderReasoningSplitTests(unittest.TestCase):
             content,
             reasoning,
         )
-        second = extract_cursor_agent_parts(
+        extract_cursor_agent_parts(
             {
                 "type": "assistant",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": opening}]},
@@ -136,8 +209,8 @@ class ProviderReasoningSplitTests(unittest.TestCase):
             content,
             reasoning,
         )
-        self.assertEqual(first.content, opening)
-        self.assertEqual(second.content, "")
+        done = extract_cursor_agent_parts({"type": "result", "result": opening}, content, reasoning)
+        self.assertEqual(done.content, opening)
         self.assertEqual(content.text, opening)
 
     def test_cursor_result_emits_unseen_suffix(self) -> None:
@@ -155,9 +228,185 @@ class ProviderReasoningSplitTests(unittest.TestCase):
             {"type": "result", "result": opening + rest},
             content,
         )
-        self.assertEqual(first.content, opening)
-        self.assertEqual(done.content, rest)
-        self.assertEqual(content.text, opening + rest)
+        self.assertEqual(first.content, "")
+        self.assertEqual(done.content, opening + "\n\n" + rest)
+        self.assertEqual(content.text, opening + "\n\n" + rest)
+
+    def test_cursor_pre_tool_narration_is_reasoning_not_content(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        notice = (
+            "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work。"
+            "如需记录，请先发送任务编号（例如 `TSK-123`）。"
+        )
+        narration = notice + "\n\n我先打开这本 EPUB，从目录和前言判断它在讲什么。"
+        answer = notice + "\n\n这是 O’Reilly 的早期预览电子书《Evals for AI Engineers》。"
+        extract_cursor_agent_parts(
+            {
+                "type": "thinking",
+                "subtype": "delta",
+                "text": "正在查看用户提供的 EPUB 文件，准备分析其内容。",
+            },
+            content,
+            reasoning,
+        )
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": narration}]},
+            },
+            content,
+            reasoning,
+        )
+        tool = extract_cursor_agent_parts(
+            {"type": "tool_call", "subtype": "started", "call_id": "tool_1"},
+            content,
+            reasoning,
+        )
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            },
+            content,
+            reasoning,
+        )
+        done = extract_cursor_agent_parts(
+            {"type": "result", "result": narration + answer},
+            content,
+            reasoning,
+        )
+        self.assertTrue(tool.reasoning.endswith(narration))
+        self.assertEqual(done.content, answer)
+        self.assertNotIn("我先打开这本 EPUB", done.content)
+        self.assertNotIn("我先打开这本 EPUB", content.text)
+        self.assertIn("正在查看用户提供的 EPUB 文件", reasoning.text)
+        self.assertIn("我先打开这本 EPUB", reasoning.text)
+
+    def test_cursor_result_extends_last_segment_prefix(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        narration = "我先打开这本 EPUB，从目录和前言判断它在讲什么。"
+        prefix = "不完全是必须二选一，但启动、恢复、外部打开"
+        rest = "这三件事必须只有一个主人。"
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": narration}]},
+            },
+            content,
+            reasoning,
+        )
+        extract_cursor_agent_parts(
+            {"type": "tool_call", "subtype": "started", "call_id": "tool_1"},
+            content,
+            reasoning,
+        )
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": prefix}]},
+            },
+            content,
+            reasoning,
+        )
+        done = extract_cursor_agent_parts(
+            {"type": "result", "result": narration + prefix + rest},
+            content,
+            reasoning,
+        )
+        self.assertEqual(done.content, prefix + rest)
+        self.assertEqual(content.text, prefix + rest)
+        self.assertNotIn("我先打开这本 EPUB", content.text)
+
+    def test_cursor_partial_pre_tool_narration_is_held_then_reasoning(self) -> None:
+        content = TextAssembler()
+        reasoning = TextAssembler()
+        narration = "我先打开这本 EPUB，从目录和前言判断它在讲什么。"
+        answer = "这是 O’Reilly 的早期预览电子书《Evals for AI Engineers》。"
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "subtype": "delta",
+                "timestamp_ms": 1,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": narration}]},
+            },
+            content,
+            reasoning,
+        )
+        extract_cursor_agent_parts(
+            {"type": "tool_call", "subtype": "started", "call_id": "tool_1"},
+            content,
+            reasoning,
+        )
+        streamed = extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "subtype": "delta",
+                "timestamp_ms": 2,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            },
+            content,
+            reasoning,
+        )
+        done = extract_cursor_agent_parts(
+            {"type": "result", "result": narration + answer},
+            content,
+            reasoning,
+        )
+        self.assertEqual(streamed.content, answer)
+        self.assertEqual(done.content, "")
+        self.assertEqual(content.text, answer)
+        self.assertIn(narration, reasoning.text)
+
+    def test_cursor_result_does_not_prepend_earlier_segments(self) -> None:
+        assembler = TextAssembler()
+        assembler.feed("这是 O’Reilly 的早期预览电子书。")
+        delta = assembler.feed("我先打开这本 EPUB。这是 O’Reilly 的早期预览电子书。")
+        self.assertEqual(delta, "")
+        self.assertEqual(assembler.text, "这是 O’Reilly 的早期预览电子书。")
+
+    def test_stale_shorter_snapshot_does_not_append_old_draft(self) -> None:
+        assembler = TextAssembler()
+        notice = "当前会话没有绑定 TutuStudio Task，本轮不会记录到 Work。"
+        answer = notice + "这是 O’Reilly 的早期预览电子书《Evals for AI Engineers》。"
+        draft = notice + "我先打开这本 EPUB，从目录和前言判断它在讲什么。"
+        self.assertEqual(assembler.feed(answer), answer)
+        self.assertEqual(assembler.feed(draft), "")
+        self.assertEqual(assembler.text, answer)
+
+    def test_cursor_skips_buffered_assistant_flush(self) -> None:
+        content = TextAssembler()
+        answer = "这是 O’Reilly 的早期预览电子书。"
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "timestamp_ms": 1,
+                "subtype": "delta",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            },
+            content,
+        )
+        extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "model_call_id": "call_1",
+                "timestamp_ms": 2,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+            },
+            content,
+        )
+        late = extract_cursor_agent_parts(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "我先打开这本 EPUB。"}]},
+            },
+            content,
+        )
+        done = extract_cursor_agent_parts({"type": "result", "result": answer}, content)
+        self.assertEqual(late.content, "")
+        self.assertEqual(done.content, answer)
+        self.assertEqual(content.text, answer)
 
     def test_assistant_thinking_blocks_are_split(self) -> None:
         text, thinking = extract_parts_from_content(
